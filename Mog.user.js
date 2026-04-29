@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mog Scripts
 // @namespace    https://github.com/mateusobozovski/MogScripts
-// @version      0.1.0
+// @version      0.2.0
 // @description  Toolkit pessoal para Tribal Wars
 // @author       Mog
 // @match        https://*.tribalwars.com.br/game.php?*
@@ -15,7 +15,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.1.0';
+  const VERSION = '0.2.0';
   const STORAGE_KEY = 'mog_state_v1';
 
   const UNITS = [
@@ -31,21 +31,32 @@
     { id: 'catapult', name: 'Catapulta',        building: 'Oficina'  },
   ];
 
-  const DEFAULT_STATE = {
-    enabled: false,
-    ui: { activeTab: 'recruiter' },
-    recruiter: {
-      groupId: 0,
-      intervalMin: 5,
-      intervalMax: 12,
-      units: Object.fromEntries(UNITS.map(u => [u.id, {
+  const GROUP_ALL = { id: 0, name: 'Todos' };
+
+  function makeProfile(overrides = {}) {
+    return {
+      id: overrides.id || `p_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      name: overrides.name || 'Novo modelo',
+      enabled: overrides.enabled ?? false,
+      groupId: overrides.groupId ?? 0,
+      intervalMin: overrides.intervalMin ?? 5,
+      intervalMax: overrides.intervalMax ?? 12,
+      units: overrides.units || Object.fromEntries(UNITS.map(u => [u.id, {
         enabled: false,
         target: 0,
         perQueue: 0,
         maxQueues: 0,
       }])),
-      log: [],
       nextRunAt: 0,
+    };
+  }
+
+  const DEFAULT_STATE = {
+    enabled: false,
+    ui: { activeTab: 'recruiter', editingProfileId: null },
+    recruiter: {
+      profiles: [],
+      log: [],
     },
   };
 
@@ -55,22 +66,40 @@
       const raw = GM_getValue(STORAGE_KEY, null);
       if (!raw) return structuredClone(DEFAULT_STATE);
       const parsed = JSON.parse(raw);
-      return deepMerge(structuredClone(DEFAULT_STATE), parsed);
+      return migrateState(parsed);
     } catch {
       return structuredClone(DEFAULT_STATE);
     }
   }
-  function saveState(s) { GM_setValue(STORAGE_KEY, JSON.stringify(s)); }
-  function deepMerge(target, src) {
-    for (const k of Object.keys(src)) {
-      if (src[k] && typeof src[k] === 'object' && !Array.isArray(src[k])) {
-        target[k] = deepMerge(target[k] || {}, src[k]);
-      } else {
-        target[k] = src[k];
-      }
+
+  function migrateState(parsed) {
+    const base = structuredClone(DEFAULT_STATE);
+    base.enabled = parsed.enabled ?? false;
+    if (parsed.ui) base.ui = { ...base.ui, ...parsed.ui };
+
+    if (parsed.recruiter?.profiles) {
+      base.recruiter.profiles = parsed.recruiter.profiles.map(p => makeProfile(p));
+      base.recruiter.log = Array.isArray(parsed.recruiter.log) ? parsed.recruiter.log : [];
+      return base;
     }
-    return target;
+
+    // Migração v1 (config única) → profiles[]
+    const old = parsed.recruiter;
+    if (old && old.units) {
+      base.recruiter.profiles = [makeProfile({
+        name: 'Modelo principal',
+        enabled: parsed.enabled ?? false,
+        groupId: old.groupId ?? 0,
+        intervalMin: old.intervalMin ?? 5,
+        intervalMax: old.intervalMax ?? 12,
+        units: old.units,
+      })];
+      base.recruiter.log = Array.isArray(old.log) ? old.log : [];
+    }
+    return base;
   }
+
+  function saveState(s) { GM_setValue(STORAGE_KEY, JSON.stringify(s)); }
 
   let state = loadState();
   const persist = () => saveState(state);
@@ -89,23 +118,19 @@
       return groups.map(g => ({ id: Number(g.group_id), name: g.name })).filter(g => g.id);
     },
 
+    async fetchAllVillages() {
+      const url = `/game.php?screen=overview_villages&mode=combined`;
+      const res = await fetch(url, { credentials: 'include' });
+      const html = await res.text();
+      return parseVillagesFromOverview(html);
+    },
+
     async fetchGroupVillages(groupId) {
+      if (!groupId) return this.fetchAllVillages();
       const url = `/game.php?screen=overview_villages&mode=combined&group=${groupId}`;
       const res = await fetch(url, { credentials: 'include' });
       const html = await res.text();
-      const doc = new DOMParser().parseFromString(html, 'text/html');
-      const links = doc.querySelectorAll('table#combined_table a[href*="village="]');
-      const seen = new Set();
-      const villages = [];
-      links.forEach(a => {
-        const m = a.getAttribute('href').match(/village=(\d+)/);
-        if (!m) return;
-        const id = m[1];
-        if (seen.has(id)) return;
-        seen.add(id);
-        villages.push({ id, name: a.textContent.trim() });
-      });
-      return villages;
+      return parseVillagesFromOverview(html);
     },
 
     async fetchTrainData(villageId) {
@@ -130,19 +155,7 @@
         units[u.id] = count;
       });
 
-      const queue = [];
-      doc.querySelectorAll('table.train_list tbody tr, table#trainqueue tbody tr, .unit-queue tr').forEach(row => {
-        const img = row.querySelector('img[src*="unit_"]');
-        if (!img) return;
-        const m = img.getAttribute('src').match(/unit_(\w+?)\.(?:png|webp)/);
-        const unitId = m?.[1];
-        if (!unitId) return;
-        const cellTxt = row.querySelector('td')?.textContent || '';
-        const cm = cellTxt.match(/(\d+)/);
-        const count = cm ? parseInt(cm[1], 10) : 0;
-        queue.push({ unitId, count });
-      });
-
+      const queue = parseTrainQueue(doc);
       return { units, queue };
     },
 
@@ -164,16 +177,68 @@
     },
   };
 
+  function parseVillagesFromOverview(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const links = doc.querySelectorAll('table#combined_table a[href*="village="]');
+    const seen = new Set();
+    const villages = [];
+    links.forEach(a => {
+      const m = a.getAttribute('href').match(/village=(\d+)/);
+      if (!m) return;
+      const id = m[1];
+      if (seen.has(id)) return;
+      seen.add(id);
+      villages.push({ id, name: a.textContent.trim() });
+    });
+    return villages;
+  }
+
+  // Parser robusto: ignora o form de recrutamento e lê só o bloco "Ordens de
+  // construção". Cada linha com img unit_<id>.png é uma fila ativa daquela unidade.
+  function parseTrainQueue(doc) {
+    const queue = [];
+    const seenRows = new Set();
+
+    const rows = doc.querySelectorAll(
+      'table.train_list tbody tr, table#trainqueue tbody tr, .unit-queue tr, table.vis tbody tr'
+    );
+
+    rows.forEach(row => {
+      // O form de recrutamento também tem imgs unit_*; filtra por linhas que
+      // tenham timer/progress (característica da fila, não do form).
+      const hasTimer = row.querySelector('.lit-item, .progress, .timer, span.grey, td.lit-item');
+      const img = row.querySelector('img[src*="unit_"]');
+      if (!img) return;
+      if (!hasTimer) return;
+      if (seenRows.has(row)) return;
+      seenRows.add(row);
+
+      const m = img.getAttribute('src').match(/unit_(\w+?)\.(?:png|webp)/);
+      const unitId = m?.[1];
+      if (!unitId) return;
+
+      // Quantidade: primeira célula com texto numérico.
+      let count = 0;
+      for (const td of row.querySelectorAll('td')) {
+        const cm = td.textContent.trim().match(/^(\d+)\b/);
+        if (cm) { count = parseInt(cm[1], 10); break; }
+      }
+      queue.push({ unitId, count });
+    });
+
+    return queue;
+  }
+
   // ---------- recruiter engine ----------
   function pushLog(msg) {
     const ts = new Date().toLocaleTimeString('pt-BR');
     state.recruiter.log.unshift(`[${ts}] ${msg}`);
-    state.recruiter.log = state.recruiter.log.slice(0, 60);
+    state.recruiter.log = state.recruiter.log.slice(0, 80);
     persist();
     if (typeof renderLog === 'function') renderLog();
   }
 
-  function computeRecruitForVillage(cfg, trainData) {
+  function computeRecruitForVillage(profile, trainData) {
     const queueByUnit = {};
     trainData.queue.forEach(q => {
       queueByUnit[q.unitId] = (queueByUnit[q.unitId] || 0) + 1;
@@ -186,7 +251,7 @@
 
     const toRecruit = {};
     for (const u of UNITS) {
-      const c = cfg.units[u.id];
+      const c = profile.units[u.id];
       if (!c?.enabled) continue;
       if (c.perQueue <= 0 || c.maxQueues <= 0 || c.target <= 0) continue;
 
@@ -204,87 +269,133 @@
     return toRecruit;
   }
 
-  async function runRecruiterCycle() {
-    if (!state.enabled) return;
-    const cfg = state.recruiter;
-    if (!cfg.groupId) { pushLog('Nenhum grupo selecionado.'); return; }
+  async function runProfileCycle(profile) {
+    if (!state.enabled || !profile.enabled) return;
 
-    pushLog('Ciclo iniciado.');
+    pushLog(`[${profile.name}] ciclo iniciado.`);
     let villages;
     try {
-      villages = await Game.fetchGroupVillages(cfg.groupId);
+      villages = await Game.fetchGroupVillages(profile.groupId);
     } catch (e) {
-      pushLog('Erro ao buscar aldeias: ' + e.message);
+      pushLog(`[${profile.name}] erro ao buscar aldeias: ${e.message}`);
       return;
     }
-    if (!villages.length) { pushLog('Grupo sem aldeias.'); return; }
+    if (!villages.length) {
+      pushLog(`[${profile.name}] grupo sem aldeias.`);
+      return;
+    }
 
     let touched = 0;
     for (const v of villages) {
-      if (!state.enabled) break;
+      if (!state.enabled || !profile.enabled) break;
       try {
         const td = await Game.fetchTrainData(v.id);
-        const recruit = computeRecruitForVillage(cfg, td);
+        const recruit = computeRecruitForVillage(profile, td);
         if (Object.keys(recruit).length === 0) continue;
         const result = await Game.submitRecruit(v.id, recruit);
         const ok = result && (result.error == null);
         if (ok) {
           const summary = Object.entries(recruit)
-            .map(([k, v]) => `${v} ${UNITS.find(u => u.id === k)?.name || k}`)
+            .map(([k, val]) => `${val} ${UNITS.find(u => u.id === k)?.name || k}`)
             .join(', ');
-          pushLog(`${v.name}: ${summary}`);
+          pushLog(`[${profile.name}] ${v.name}: ${summary}`);
           touched++;
         } else {
-          pushLog(`${v.name}: falha ao recrutar (${result?.error || 'desconhecido'})`);
+          pushLog(`[${profile.name}] ${v.name}: falha (${result?.error || 'desconhecido'})`);
         }
       } catch (e) {
-        pushLog(`${v.name}: erro (${e.message})`);
+        pushLog(`[${profile.name}] ${v.name}: erro (${e.message})`);
       }
       await sleep(400 + Math.random() * 600);
     }
-    pushLog(`Ciclo finalizado. ${touched} aldeia(s) atualizada(s).`);
+    pushLog(`[${profile.name}] ciclo finalizado. ${touched} aldeia(s) atualizada(s).`);
   }
 
-  // ---------- scheduler ----------
-  let schedulerTimer = null;
+  // ---------- scheduler (per-profile) ----------
+  const profileTimers = new Map();
 
-  function nextDelayMs() {
-    const min = Math.max(1, state.recruiter.intervalMin);
-    const max = Math.max(min, state.recruiter.intervalMax);
+  function nextDelayMs(profile) {
+    const min = Math.max(1, profile.intervalMin);
+    const max = Math.max(min, profile.intervalMax);
     const minutes = min + Math.random() * (max - min);
     return Math.round(minutes * 60 * 1000);
   }
 
-  function scheduleNext() {
-    clearTimeout(schedulerTimer);
-    if (!state.enabled) return;
-    const delay = nextDelayMs();
-    state.recruiter.nextRunAt = Date.now() + delay;
+  function scheduleProfileNext(profile) {
+    clearTimeout(profileTimers.get(profile.id));
+    if (!state.enabled || !profile.enabled) {
+      profile.nextRunAt = 0;
+      return;
+    }
+    const delay = nextDelayMs(profile);
+    profile.nextRunAt = Date.now() + delay;
     persist();
     if (typeof renderStatus === 'function') renderStatus();
-    schedulerTimer = setTimeout(async () => {
-      await runRecruiterCycle();
-      scheduleNext();
+    const t = setTimeout(async () => {
+      // Pode ter sido desligado durante a espera
+      const fresh = state.recruiter.profiles.find(p => p.id === profile.id);
+      if (!fresh) return;
+      if (state.enabled && fresh.enabled) {
+        await runProfileCycle(fresh);
+        scheduleProfileNext(fresh);
+      }
     }, delay);
+    profileTimers.set(profile.id, t);
   }
 
-  function startScheduler() {
+  function startProfile(profile) {
+    profile.enabled = true;
+    persist();
+    if (state.enabled) scheduleProfileNext(profile);
+    pushLog(`[${profile.name}] ativado.`);
+  }
+
+  function stopProfile(profile) {
+    profile.enabled = false;
+    profile.nextRunAt = 0;
+    clearTimeout(profileTimers.get(profile.id));
+    profileTimers.delete(profile.id);
+    persist();
+    pushLog(`[${profile.name}] desativado.`);
+    if (typeof renderStatus === 'function') renderStatus();
+  }
+
+  function startGlobal() {
     state.enabled = true;
     persist();
-    scheduleNext();
+    state.recruiter.profiles.forEach(p => {
+      if (p.enabled) scheduleProfileNext(p);
+    });
     pushLog('Bot iniciado.');
   }
 
-  function stopScheduler() {
+  function stopGlobal() {
     state.enabled = false;
-    state.recruiter.nextRunAt = 0;
+    state.recruiter.profiles.forEach(p => {
+      p.nextRunAt = 0;
+      clearTimeout(profileTimers.get(p.id));
+    });
+    profileTimers.clear();
     persist();
-    clearTimeout(schedulerTimer);
     pushLog('Bot pausado.');
     if (typeof renderStatus === 'function') renderStatus();
   }
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  // ---------- groups cache ----------
+  let groupsCache = null;
+  async function getGroups(force = false) {
+    if (groupsCache && !force) return groupsCache;
+    try {
+      const fetched = await Game.fetchGroups();
+      groupsCache = [GROUP_ALL, ...fetched];
+    } catch (e) {
+      pushLog('Erro ao listar grupos: ' + e.message);
+      groupsCache = [GROUP_ALL];
+    }
+    return groupsCache;
+  }
 
   // ---------- ui ----------
   GM_addStyle(`
@@ -321,7 +432,7 @@
     .mog-panel {
       position: fixed;
       top: 0; right: 0; bottom: 0;
-      width: 380px;
+      width: 420px;
       background: linear-gradient(180deg, #0f172a 0%, #0b1220 100%);
       color: #e2e8f0;
       font-family: 'Segoe UI', system-ui, sans-serif;
@@ -411,6 +522,7 @@
     .mog-section-title {
       font-size: 11px; font-weight: 700; text-transform: uppercase;
       color: #94a3b8; letter-spacing: 0.6px; margin-bottom: 10px;
+      display: flex; align-items: center; justify-content: space-between;
     }
 
     .mog-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
@@ -424,6 +536,7 @@
       width: 70px; text-align: center;
     }
     .mog-select { width: auto; min-width: 120px; flex: 1; text-align: left; padding: 6px 8px; }
+    .mog-input.mog-input-text { width: 100%; text-align: left; flex: 1; }
     .mog-input:focus, .mog-select:focus { border-color: #6366f1; }
     .mog-input[type="number"]::-webkit-inner-spin-button { opacity: 0.4; }
 
@@ -454,9 +567,9 @@
       letter-spacing: 0.3px;
     }
     .mog-btn:hover { filter: brightness(1.12); }
-    .mog-btn.mog-btn-ghost {
-      background: #1e293b; color: #cbd5e1;
-    }
+    .mog-btn.mog-btn-ghost { background: #1e293b; color: #cbd5e1; }
+    .mog-btn.mog-btn-danger { background: linear-gradient(135deg, #dc2626, #991b1b); }
+    .mog-btn.mog-btn-sm { padding: 6px 10px; font-size: 11px; width: auto; }
 
     .mog-status {
       display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
@@ -472,7 +585,7 @@
     .mog-log {
       background: #050a14; border: 1px solid #1e293b;
       border-radius: 8px; padding: 8px;
-      max-height: 160px; overflow-y: auto;
+      max-height: 180px; overflow-y: auto;
       font-family: 'JetBrains Mono', 'Consolas', monospace;
       font-size: 10.5px; color: #94a3b8; line-height: 1.5;
     }
@@ -480,6 +593,41 @@
       content: 'Sem atividade ainda.'; color: #475569; font-style: italic;
     }
     .mog-log div { padding: 1px 0; }
+
+    .mog-profile-card {
+      background: #0a1120; border: 1px solid #1e293b;
+      border-radius: 10px; padding: 12px; margin-bottom: 10px;
+      display: flex; align-items: center; gap: 10px;
+    }
+    .mog-profile-card.mog-profile-on { border-color: #16a34a; box-shadow: 0 0 0 1px rgba(22,163,74,0.25); }
+    .mog-profile-info { flex: 1; min-width: 0; }
+    .mog-profile-name { font-weight: 700; color: #f1f5f9; font-size: 13px; }
+    .mog-profile-meta { font-size: 10.5px; color: #64748b; margin-top: 3px; }
+    .mog-profile-actions { display: flex; gap: 4px; flex-shrink: 0; }
+
+    .mog-iconbtn {
+      background: #1e293b; color: #cbd5e1; border: 1px solid #334155;
+      border-radius: 6px; padding: 5px 8px; font-size: 11px; font-weight: 600;
+      cursor: pointer; transition: all 0.15s;
+    }
+    .mog-iconbtn:hover { background: #334155; color: #fff; }
+    .mog-iconbtn.mog-iconbtn-on {
+      background: linear-gradient(135deg, #16a34a, #15803d);
+      color: #f0fdf4; border-color: #166534;
+    }
+    .mog-iconbtn.mog-iconbtn-danger:hover { background: #7f1d1d; color: #fecaca; border-color: #991b1b; }
+
+    .mog-empty {
+      text-align: center; color: #64748b; padding: 20px 10px;
+      font-size: 12px; font-style: italic;
+    }
+
+    .mog-back {
+      background: none; border: none; color: #94a3b8;
+      cursor: pointer; font-size: 12px; padding: 4px 0;
+      margin-bottom: 8px; display: flex; align-items: center; gap: 4px;
+    }
+    .mog-back:hover { color: #e2e8f0; }
   `);
 
   // ---- DOM elements ----
@@ -525,22 +673,143 @@
     }
   }
   toggleBtn.addEventListener('click', () => {
-    if (state.enabled) stopScheduler();
-    else startScheduler();
+    if (state.enabled) stopGlobal();
+    else startGlobal();
     syncToggle();
+    render();
   });
   syncToggle();
 
-  // ---- recruiter tab ----
   const body = panel.querySelector('#mog-body');
 
-  function renderRecruiterTab() {
+  // ---- router ----
+  function render() {
+    if (state.ui.editingProfileId) {
+      const p = state.recruiter.profiles.find(x => x.id === state.ui.editingProfileId);
+      if (!p) {
+        state.ui.editingProfileId = null;
+        return render();
+      }
+      renderEditor(p);
+    } else {
+      renderProfilesList();
+    }
+  }
+
+  // ---- profiles list ----
+  function renderProfilesList() {
     body.innerHTML = `
       <div class="mog-section">
-        <div class="mog-section-title">Grupo de aldeias</div>
+        <div class="mog-section-title">
+          <span>Modelos</span>
+          <button class="mog-btn mog-btn-sm" id="mog-add-profile">+ Novo modelo</button>
+        </div>
+        <div id="mog-profiles-wrap"></div>
+      </div>
+
+      <div class="mog-section">
+        <div class="mog-section-title">Status</div>
+        <div class="mog-status">
+          <div class="mog-stat">
+            <div class="mog-stat-label">Estado</div>
+            <div class="mog-stat-value" id="mog-stat-state">—</div>
+          </div>
+          <div class="mog-stat">
+            <div class="mog-stat-label">Modelos ativos</div>
+            <div class="mog-stat-value" id="mog-stat-active">—</div>
+          </div>
+        </div>
+        <div class="mog-log" id="mog-log"></div>
+      </div>
+    `;
+
+    renderProfilesCards();
+    renderStatus();
+    renderLog();
+
+    body.querySelector('#mog-add-profile').addEventListener('click', () => {
+      const p = makeProfile({ name: `Modelo ${state.recruiter.profiles.length + 1}` });
+      state.recruiter.profiles.push(p);
+      state.ui.editingProfileId = p.id;
+      persist();
+      render();
+    });
+  }
+
+  function renderProfilesCards() {
+    const wrap = body.querySelector('#mog-profiles-wrap');
+    if (!wrap) return;
+
+    if (!state.recruiter.profiles.length) {
+      wrap.innerHTML = `<div class="mog-empty">Nenhum modelo criado ainda. Clique em "+ Novo modelo".</div>`;
+      return;
+    }
+
+    wrap.innerHTML = state.recruiter.profiles.map(p => {
+      const enabledUnits = Object.values(p.units).filter(u => u.enabled).length;
+      return `
+        <div class="mog-profile-card ${p.enabled ? 'mog-profile-on' : ''}">
+          <div class="mog-profile-info">
+            <div class="mog-profile-name">${escapeHtml(p.name)}</div>
+            <div class="mog-profile-meta">
+              ${enabledUnits} unid. · ${p.intervalMin}–${p.intervalMax} min
+              ${p.enabled && p.nextRunAt ? ' · próx. ' + new Date(p.nextRunAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) : ''}
+            </div>
+          </div>
+          <div class="mog-profile-actions">
+            <button class="mog-iconbtn ${p.enabled ? 'mog-iconbtn-on' : ''}" data-action="toggle" data-pid="${p.id}">
+              ${p.enabled ? 'ON' : 'OFF'}
+            </button>
+            <button class="mog-iconbtn" data-action="edit" data-pid="${p.id}">Editar</button>
+            <button class="mog-iconbtn mog-iconbtn-danger" data-action="delete" data-pid="${p.id}">×</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    wrap.querySelectorAll('button[data-action]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const pid = btn.dataset.pid;
+        const action = btn.dataset.action;
+        const p = state.recruiter.profiles.find(x => x.id === pid);
+        if (!p) return;
+
+        if (action === 'toggle') {
+          if (p.enabled) stopProfile(p);
+          else startProfile(p);
+          renderProfilesCards();
+          renderStatus();
+        } else if (action === 'edit') {
+          state.ui.editingProfileId = p.id;
+          persist();
+          render();
+        } else if (action === 'delete') {
+          if (!confirm(`Excluir o modelo "${p.name}"?`)) return;
+          if (p.enabled) stopProfile(p);
+          state.recruiter.profiles = state.recruiter.profiles.filter(x => x.id !== pid);
+          persist();
+          renderProfilesCards();
+          renderStatus();
+        }
+      });
+    });
+  }
+
+  // ---- profile editor ----
+  async function renderEditor(profile) {
+    body.innerHTML = `
+      <button class="mog-back" id="mog-back">← Voltar para modelos</button>
+
+      <div class="mog-section">
+        <div class="mog-section-title">Identificação</div>
         <div class="mog-row">
-          <select class="mog-select" id="mog-group"></select>
-          <button class="mog-btn mog-btn-ghost" id="mog-refresh-groups" style="width:auto;padding:6px 10px;font-size:11px;">↻</button>
+          <span class="mog-label" style="flex:0;min-width:50px;">Nome</span>
+          <input type="text" class="mog-input mog-input-text" id="mog-prof-name" value="${escapeHtml(profile.name)}">
+        </div>
+        <div class="mog-row">
+          <span class="mog-label" style="flex:0;min-width:50px;">Grupo</span>
+          <select class="mog-select" id="mog-prof-group"></select>
+          <button class="mog-iconbtn" id="mog-refresh-groups" title="Atualizar grupos">↻</button>
         </div>
       </div>
 
@@ -556,56 +825,60 @@
         <div class="mog-section-title">Intervalo entre execuções</div>
         <div class="mog-row">
           <span class="mog-label">De</span>
-          <input type="number" class="mog-input" id="mog-int-min" min="1" value="${state.recruiter.intervalMin}">
+          <input type="number" class="mog-input" id="mog-int-min" min="1" value="${profile.intervalMin}">
           <span class="mog-label" style="flex:0;">a</span>
-          <input type="number" class="mog-input" id="mog-int-max" min="1" value="${state.recruiter.intervalMax}">
+          <input type="number" class="mog-input" id="mog-int-max" min="1" value="${profile.intervalMax}">
           <span class="mog-label" style="flex:0;">min</span>
         </div>
       </div>
 
       <div class="mog-section">
-        <div class="mog-section-title">Status</div>
-        <div class="mog-status">
-          <div class="mog-stat">
-            <div class="mog-stat-label">Estado</div>
-            <div class="mog-stat-value" id="mog-stat-state">—</div>
-          </div>
-          <div class="mog-stat">
-            <div class="mog-stat-label">Próxima exec.</div>
-            <div class="mog-stat-value" id="mog-stat-next">—</div>
-          </div>
+        <div class="mog-row">
+          <button class="mog-btn mog-btn-ghost" id="mog-run-now">Executar agora</button>
         </div>
-        <button class="mog-btn mog-btn-ghost" id="mog-run-now" style="margin-bottom:10px;">Executar agora</button>
-        <div class="mog-log" id="mog-log"></div>
       </div>
     `;
 
-    renderUnits();
-    renderGroups();
-    renderStatus();
-    renderLog();
+    renderEditorUnits(profile);
+    await renderEditorGroups(profile);
+
+    body.querySelector('#mog-back').addEventListener('click', () => {
+      state.ui.editingProfileId = null;
+      persist();
+      render();
+    });
+
+    body.querySelector('#mog-prof-name').addEventListener('change', e => {
+      profile.name = e.target.value.trim() || 'Sem nome';
+      persist();
+    });
+
+    body.querySelector('#mog-prof-group').addEventListener('change', e => {
+      profile.groupId = parseInt(e.target.value, 10) || 0;
+      persist();
+    });
+
+    body.querySelector('#mog-refresh-groups').addEventListener('click', async () => {
+      await renderEditorGroups(profile, true);
+    });
 
     body.querySelector('#mog-int-min').addEventListener('change', e => {
-      state.recruiter.intervalMin = Math.max(1, parseInt(e.target.value, 10) || 1);
+      profile.intervalMin = Math.max(1, parseInt(e.target.value, 10) || 1);
       persist();
     });
     body.querySelector('#mog-int-max').addEventListener('change', e => {
-      state.recruiter.intervalMax = Math.max(1, parseInt(e.target.value, 10) || 1);
+      profile.intervalMax = Math.max(1, parseInt(e.target.value, 10) || 1);
       persist();
     });
-    body.querySelector('#mog-refresh-groups').addEventListener('click', () => renderGroups(true));
-    body.querySelector('#mog-run-now').addEventListener('click', () => runRecruiterCycle());
-    body.querySelector('#mog-group').addEventListener('change', e => {
-      state.recruiter.groupId = parseInt(e.target.value, 10) || 0;
-      persist();
-    });
+
+    body.querySelector('#mog-run-now').addEventListener('click', () => runProfileCycle(profile));
   }
 
-  function renderUnits() {
+  function renderEditorUnits(profile) {
     const wrap = body.querySelector('#mog-units');
     if (!wrap) return;
     wrap.innerHTML = UNITS.map(u => {
-      const c = state.recruiter.units[u.id];
+      const c = profile.units[u.id];
       return `
         <div class="mog-unit-grid">
           <input type="checkbox" data-uid="${u.id}" data-field="enabled" ${c.enabled ? 'checked' : ''}>
@@ -623,7 +896,7 @@
       inp.addEventListener('change', e => {
         const uid = e.target.dataset.uid;
         const field = e.target.dataset.field;
-        const cfg = state.recruiter.units[uid];
+        const cfg = profile.units[uid];
         if (field === 'enabled') cfg.enabled = e.target.checked;
         else cfg[field] = Math.max(0, parseInt(e.target.value, 10) || 0);
         persist();
@@ -631,40 +904,27 @@
     });
   }
 
-  async function renderGroups(force = false) {
-    const sel = body.querySelector('#mog-group');
+  async function renderEditorGroups(profile, force = false) {
+    const sel = body.querySelector('#mog-prof-group');
     if (!sel) return;
     sel.innerHTML = `<option>Carregando...</option>`;
-    try {
-      const groups = await Game.fetchGroups();
-      if (!groups.length) {
-        sel.innerHTML = `<option value="0">Nenhum grupo encontrado</option>`;
-        return;
-      }
-      sel.innerHTML = groups.map(g =>
-        `<option value="${g.id}" ${g.id === state.recruiter.groupId ? 'selected' : ''}>${g.name}</option>`
-      ).join('');
-      if (!state.recruiter.groupId) {
-        state.recruiter.groupId = groups[0].id;
-        persist();
-      }
-    } catch (e) {
-      sel.innerHTML = `<option value="0">Erro ao carregar</option>`;
-      pushLog('Erro ao listar grupos: ' + e.message);
-    }
+    const groups = await getGroups(force);
+    sel.innerHTML = groups.map(g =>
+      `<option value="${g.id}" ${g.id === profile.groupId ? 'selected' : ''}>${escapeHtml(g.name)}</option>`
+    ).join('');
   }
 
+  // ---- status & log ----
   function renderStatus() {
     const stateEl = body.querySelector('#mog-stat-state');
-    const nextEl = body.querySelector('#mog-stat-next');
-    if (!stateEl || !nextEl) return;
-    stateEl.textContent = state.enabled ? 'Ativo' : 'Pausado';
-    stateEl.style.color = state.enabled ? '#4ade80' : '#94a3b8';
-    if (state.enabled && state.recruiter.nextRunAt) {
-      const t = new Date(state.recruiter.nextRunAt);
-      nextEl.textContent = t.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    } else {
-      nextEl.textContent = '—';
+    const activeEl = body.querySelector('#mog-stat-active');
+    if (stateEl) {
+      stateEl.textContent = state.enabled ? 'Ativo' : 'Pausado';
+      stateEl.style.color = state.enabled ? '#4ade80' : '#94a3b8';
+    }
+    if (activeEl) {
+      const n = state.recruiter.profiles.filter(p => p.enabled).length;
+      activeEl.textContent = `${n} / ${state.recruiter.profiles.length}`;
     }
   }
 
@@ -680,10 +940,18 @@
     }[c]));
   }
 
-  // status auto-refresh
-  setInterval(renderStatus, 1000);
+  // refresh card "próx." e status a cada segundo
+  setInterval(() => {
+    if (state.ui.editingProfileId) return;
+    renderProfilesCards();
+    renderStatus();
+  }, 1000);
 
   // initial render + auto-resume
-  renderRecruiterTab();
-  if (state.enabled) scheduleNext();
+  render();
+  if (state.enabled) {
+    state.recruiter.profiles.forEach(p => {
+      if (p.enabled) scheduleProfileNext(p);
+    });
+  }
 })();

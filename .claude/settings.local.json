@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git config *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(node --check c:/Projetos/MogScripts/Mog.user.js)",
+      "Bash(node -e ' *)",
+      "Bash(node --check src/Mog.user.js)",
+      "Bash(node build.js)",
+      "Read(//c/Users/mateus.gregorato/.claude/projects/c--Projetos-MogScripts/memory/**)",
+      "Bash(git fetch *)",
+      "Bash(git pull *)",
+      "Bash(git stash *)",
+      "Bash(git commit *)"
+    ]
+  }
+}

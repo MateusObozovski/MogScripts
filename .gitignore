@@ -1,5 +1,18 @@
-node_modules/
+# Código fonte (fica só na máquina local)
 src/
 
-# O arquivo raiz original pode ser removido depois de mover pra src/
+# Dependências
+node_modules/
+
+# Arquivo raiz legado (o source fica em src/)
 /Mog.user.js
+
+# Build tools (não são necessários pra instalação)
+build.js
+package.json
+package-lock.json
+
+# Docs internos
+CLAUDE.md
+plan-farmador.md
+.claude/

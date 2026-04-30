@@ -6,7 +6,8 @@ Userscript pessoal de automação para o jogo **Tribal Wars** (br142.tribalwars.
 
 ## 1. Restrições essenciais (leia antes de codar)
 
-- **Single-file**: todo o código vive em `Mog.user.js`. Não criar build step, módulos, `package.json` ou qualquer dependência externa. Tudo é vanilla JS rodando dentro do browser com `// @grant GM_*`.
+- **Build pipeline (a partir de 0.7.x)**: o **fonte real** vive em `src/Mog.user.js`. `build.js` (Node) ofusca via `javascript-obfuscator` e gera `dist/Mog.user.js` — esse é o arquivo que o Tampermonkey baixa via `@downloadURL`. **Sempre editar `src/`** e rodar `node build.js`. Há ainda `Mog.user.js` na raiz como artefato legado, sincronizado manualmente pelo usuário. Quando precisar editar, prefira `src/` e replicar pra raiz se necessário (script de sync usa `node -e` preservando linhas 10-11 que diferem nas URLs).
+- **Tudo num só arquivo de fonte**: `src/Mog.user.js` é vanilla JS no browser com `// @grant GM_*`. Não introduzir módulos ou dependências runtime — `package.json` só tem `javascript-obfuscator` como devDep.
 - **Só inicializa em `screen=storage`**: o IIFE faz early-return se `unsafeWindow.game_data.screen !== 'storage'`. O usuário gerencia tudo na aba do armazém; ela faz fetches HTTP em background pras outras aldeias. Em qualquer outra tela o script nem carrega o launcher.
 - **Persistência**: `GM_setValue/GM_getValue` com chave `mog_state_v1` (mantida fixa mesmo após mudanças de schema — usar `migrateState` pra acomodar formatos antigos).
 - **Privado, sem servidor**: nada de telemetria, analytics, fetch para domínios externos. Toda comunicação é pra `*.tribalwars.com.br` (mesma origem).
@@ -31,43 +32,49 @@ Termos usados no código e nas conversas com o usuário:
 - **Operação (Agendador)**: conjunto de alvos + origens + comandos calculados, em rascunho ou já agendado pra envio.
 - **Wave**: cada wave dentro de uma operação representa **1 comando** que sai por par origem→alvo. Ex: 2 waves = "ataque #1" + "ataque adicional #2" no mesmo POST do jogo.
 - **Bundle**: comandos com mesmo `sourceEntryId + targetCoords` formam um bundle — saem juntos num único POST com `train[N][unit]` pros adicionais.
+- **Assistente de Saque (am_farm)**: feature premium nativa do TW que mantém uma lista de aldeias bárbaras conhecidas, com modelos de tropas (A e B) reusáveis e botões "Atacar A/B" por linha. O **Farmador** lê e edita essa estrutura — não duplica.
+- **Modelo do Assistente (template_id)**: cada conta tem 2 modelos (A e B) com IDs próprios (ex: 2198/2230 numa conta, outros noutra). Convenção do bot: 1º template no DOM = "A", 2º = "B".
+- **Saque cheio**: bárbara cujo último relatório carregou o limite de saque das tropas → no ciclo seguinte, dispara modelo B (mais tropas). Detectado via `<img src=".../max_loot/1.webp">` na linha do `#plunder_list`.
+- **Com perdas**: bárbara cujo último ataque retornou com baixas → marca pra "quebra-muralha" (módulo futuro). Detectado via `dots/yellow.webp` ou `dots/red.webp`.
 
 ---
 
 ## 3. Arquitetura
 
-`Mog.user.js` é organizado em seções verticalmente, top-to-bottom:
+`src/Mog.user.js` é organizado em seções verticalmente, top-to-bottom:
 
 1. **Banner UserScript** — `@match`, `@grant`, `@version`
 2. **Early-return** — só roda em `screen=storage`
 3. **Constantes** — `UNITS`, `COMMAND_UNITS`, `BUILDINGS`, `GROUP_ALL`, `CATAPULT_TARGETS`, `DEFAULT_WORLD_CONFIG`, `DEFAULT_LATENCY`
 4. **Factories** — `makeProfile`, `makeOperation`, `makeTarget`, `makeWave`, `makeAttackModel`, `makeSourceGroup`, `makeCommand`
-5. **Storage / Migrations** — `loadState`, `migrateState`, `migrateProfile`, `migrateScheduler`, `migrateOperation`, `migrateSourceGroup`, `saveState`
-6. **Game API** — `Game.{csrf, fetchGroups, fetchAllVillages, fetchGroupVillages, _fetchVillagesPaged, fetchTrainData, submitRecruit, prepareCommand, confirmCommand, submitCommand, _readPlaceCsrf, fetchWorldConfig, fetchAllUnits}`
-7. **Parsers** — `parseVillagesFromOverview`, `parseTrainQueue`, `parseAllUnitsTable`, `parseWorldConfig`, `parseCoordsFromText`
+5. **Storage / Migrations** — `loadState`, `migrateState`, `migrateProfile`, `migrateScheduler`, `migrateOperation`, `migrateSourceGroup`, `migrateFarmer`, `saveState`
+6. **Game API** — `Game.{csrf, fetchGroups, fetchAllVillages, fetchGroupVillages, _fetchVillagesPaged, fetchTrainData, submitRecruit, prepareCommand, confirmCommand, submitCommand, _readPlaceCsrf, fetchWorldConfig, fetchAllUnits, fetchFarmTemplates, updateFarmTemplates, fetchFarmAssistantList, fetchOutgoingAttacks, fetchAllWorldVillages, dispatchFarm}`
+7. **Parsers** — `parseVillagesFromOverview`, `parseTrainQueue`, `parseAllUnitsTable`, `parseWorldConfig`, `parseCoordsFromText`, `parseFarmTemplates`, `parseFarmAssistantList`, `parseOutgoingAttacks`
 8. **Engine recrutamento** — `pushLog`, `computeRecruitForVillage`, `runProfileCycle`, `humanLikeDelay`
 9. **Engine agendador** — `distance`, `slowestSpeed`, `travelTimeMs`, `ensureWorldConfig`, `solveOperation`, `resolveUnits`, `randomMs`, `kindMatchesType`
 10. **Latência** — `measureLatency`, `refreshLatency`, `latencyCompensation`, `serverOffset`/`serverNow`/`serverToLocalTs`, `warmupConnection`
 11. **Scheduler recrutamento** — timers per-profile (`scheduleProfileNext`, etc)
 12. **Scheduler agendador** — `commandTimers`, `prepareTimers`, `preparedBundles`, `scheduleCommand`, `prepareForFire`, `executeCommand`, `cancelCommand`, `recoverScheduledCommands`, `getBundleSiblings`, `getAllScheduledCommands`, `maybeFinalizeOperation`, `activateOperation`
-13. **Groups cache** — `getGroups`
-14. **UI** — `GM_addStyle` → DOM (launcher/overlay/panel) → render funcs:
-    - **Roteamento**: `renderContent` (recruiter | scheduler | dashboard | placeholder)
+13. **Engine farmer** — `pushFarmerLog`, `runFarmerCycle`, `findNewBarbarians`, `scheduleFarmerNext`, `cancelFarmerSchedule`, `recoverFarmerSchedule`, `refreshFarmerHeader`, `updateFarmerProgress`, `distanceFields`
+14. **Groups cache** — `getGroups`
+15. **UI** — `GM_addStyle` → DOM (launcher/overlay/panel) → render funcs:
+    - **Roteamento**: `renderContent` (recruiter | scheduler | dashboard | farmer | placeholder)
     - **Recruiter**: `renderRecruiter`, `renderProfileRow`, `renderAdvanced`, `bindProfileRow`
     - **Scheduler (wizard)**: `renderScheduler`, `getOrCreateDraftOperation`, `resetDraftOperation`, `renderOpWizard`, `renderWizardStep1..4`, `renderTargetRow`, `onTargetChange`, `renderLotInline`, `renderWaveRow`, `bindLotCard`, `populateLotGroupSelect`, `importLotFromGroup`, `addVillagesByCoords`, `syncVillagesFromTextarea`, `solveOperation`, `renderResultBlock`, `renderCmdRow`
     - **Dashboard**: `renderDashboard`, `renderDashTable`, `renderDashRow`, `coordsLink`, `formatCountdown`, `updateDashCountdowns`, `dashboardSignature`, `findCommandById`
+    - **Farmer**: `renderFarmer`, `renderFarmerTemplatesBlock`, `renderFarmerTemplate`, `populateFarmerGroupSelect`, `loadFarmerTemplates`, `bindFarmer`, `bindFarmerTemplates`, `saveFarmerTemplates`
 
-### State shape (atual — schema "v4", chave de storage ainda `mog_state_v1`)
+### State shape (atual — schema "v5", chave de storage ainda `mog_state_v1`)
 
 ```js
 {
   enabled: false,                          // toggle global do recrutador
   ui: {
-    activeSection: 'recruiter',            // 'recruiter' | 'scheduler' | 'dashboard' | 'builder' | 'research'
+    activeSection: 'recruiter',            // 'recruiter' | 'scheduler' | 'dashboard' | 'farmer' | 'builder' | 'research'
     expandedProfileId: null,
     panelOpen: false,
     logCollapsed: false,
-    sideCollapsed: { account: bool, operations: bool, tools: bool },
+    sideCollapsed: { account: bool, operations: bool, loot: bool, tools: bool },
   },
   recruiter: {
     profiles: [{
@@ -108,10 +115,25 @@ Termos usados no código e nas conversas com o usuário:
     log: [],   // máx 500
     ui: { activeOperationId, wizardStep },
   },
+  farmer: {
+    enabled: false,                                  // toggle global do módulo
+    groupId: 0,                                      // 0 = Todos
+    timing: { minMs: 500, maxMs: 1000 },             // jitter entre envios
+    cycleMin: 10,                                    // minutos entre ciclos automáticos
+    maxPerBarbarian: 1,                              // ataques simultâneos por bárbara
+    searchRadius: 10,                                // raio (campos) pra "Buscar bárbaras"
+    needsWallBreak: [{ x, y, lastAttempt }],         // bárbaras detectadas com defesa
+    log: [],                                         // máx 200
+    ui: { collapsed: {} },
+    nextRunAt: 0,                                    // timestamp do próximo ciclo
+    busy: false,                                     // lock — limpo no boot
+  },
 }
 ```
 
-`profile.running` (recrutador), `commandTimers/prepareTimers/preparedBundles` (agendador) são transitórios — não persistem.
+`profile.running` (recrutador), `commandTimers/prepareTimers/preparedBundles` (agendador), `farmerTimerId/farmerTemplatesCache` (farmer), `Game._worldVillagesCache` (cache de `/map/village.txt`) são transitórios — não persistem.
+
+**Modelos A/B do Assistente NUNCA persistem em `state.farmer`** — sempre lidos do jogo via `Game.fetchFarmTemplates()` e cacheados em memória local da função (`farmerTemplatesCache`). Quando usuário edita na UI e clica "Salvar", faz POST direto pra atualizar o assistente do jogo.
 
 ### Migrações de schema
 
@@ -121,6 +143,7 @@ Termos usados no código e nas conversas com o usuário:
 | v2 (0.2.0) | Introduz `recruiter.profiles[]` | `profiles.map(makeProfile)` |
 | v3 (0.5.0) | `units[id]` perde `perQueue/maxQueues`; surge `buildings[name]` + `rrCursor` | `migrateProfile` agrupa valores por edifício |
 | v4 (0.6.0) | Adiciona `state.scheduler` com operações, comandos, world config cache, latency, log próprio. State v3 sem scheduler vira default vazio | `migrateState` chama `migrateScheduler(parsed.scheduler)` que cria default se ausente |
+| v5 (0.7.0) | Adiciona `state.farmer` (toggle, config, log, lista de wall-break, busy lock). `ui.activeSection` ganha `'farmer'` e `ui.sideCollapsed` ganha chave `'loot'` | `migrateState` chama `migrateFarmer(parsed.farmer)` que cria default se ausente. `migrateFarmer` zera `busy` no boot pra não travar após reload |
 
 **Sempre que mudar o shape, adicionar uma linha aqui e código de migração.** Nunca quebrar usuários antigos.
 
@@ -155,6 +178,30 @@ Termos usados no código e nas conversas com o usuário:
 - **Velocidade das unidades**: `<speed>` retornado por `/interface.php?func=get_unit_info` **já vem ajustado** pelos fatores `speed`/`unit_speed` do mundo. NÃO multiplicar/dividir por nada. Fórmula: `duration_ms = mpf × distance × 60 × 1000`.
 - **CSRF do `screen=place`**: o nome do input hidden muda a cada sessão. `Game._readPlaceCsrf` faz GET inicial, lê o input hidden cujo nome não bate com nenhum dos conhecidos, e cacheia. O campo `h` (CSRF normal) é injetado por JS após o load — usar `Game.csrf()` (= `unsafeWindow.game_data.csrf`) como fallback.
 - **Coords clicáveis no Painel**: `<a href="info_village?id=X#x;y" target="_blank">`. Usa `villageId` quando disponível (origens), senão fallback.
+
+### Farmador
+- **Pré-requisito do usuário**: conta com Assistente de Saque ativo (premium TW). Sem isso, `screen=am_farm` não funciona.
+- **Foco em bárbaras**: módulo só farma `owner === 0` (bárbaras + aldeias-bônus do mapa). Farm de jogadores inativos é feature futura.
+- **Modelos vivem no jogo**: o bot **lê e edita** os modelos A e B do Assistente nativo, não duplica. Cache em memória (`farmerTemplatesCache`); persistência fica no servidor TW.
+- **IDs dinâmicos de template**: cada conta tem IDs próprios (ex: 2198 e 2230 num mundo). Convenção: 1º template no DOM = "A", 2º = "B". `parseFarmTemplates` extrai IDs reais.
+- **CSRF do am_farm vem na URL do form**, não como `<input name="h">`. `parseFarmTemplates` extrai do `form.action` via regex `[?&]h=([a-f0-9]+)`. Mesma `h` serve pra `updateFarmTemplates` (no body) e `dispatchFarm` (no body). É CSRF de sessão, não rotaciona por request.
+- **Endpoint de dispatch**: `POST /game.php?village=<source>&screen=am_farm&mode=farm&ajaxaction=farm&json=1` com headers `TribalWars-Ajax: 1` e `X-Requested-With: XMLHttpRequest`. Body: `target=<targetId>&template_id=<id>&source=<sourceId>&h=<csrf>`. Resposta JSON; erro retorna `{ error: [...] }`.
+- **Detecção de "saque cheio"**: `<img src=".../max_loot/1.webp">` na linha do `#plunder_list`. Qualquer outra variação (`max_loot/0`) = saque parcial.
+- **Detecção de "com perdas"**: `<img src=".../dots/yellow.webp">` ou `dots/red.webp` (vitória parcial / derrota). `dots/green` = vitória total sem perdas.
+- **Decisão A/B/spy no ciclo**:
+  - Default → modelo A
+  - `target.fullLoot === true` → modelo B
+  - `target.hadLosses === true` → registra em `needsWallBreak[]`, **não dispara** (envio de spy puro requer troca temporária de template — fica como melhoria futura)
+- **`maxPerBarbarian`**: contador local por ciclo (`Map<villageId, count>`), **não soma global persistida**. Cada execução começa do zero.
+- **Spy via troca temporária de template** (Buscar bárbaras): salva snapshot do A original, substitui por `{spy:1, resto:0}`, dispara N espiões, restaura A no `finally`. Se a aba fechar no meio, modelo A pode ficar bagunçado — usuário restaura manualmente. Aceitável pro MVP.
+- **Filtro "ataque a caminho"**: antes de cada ciclo/busca, lê `Game.fetchOutgoingAttacks()` (parsea `screen=place&mode=command`, filtra `data-command-type="attack"`). Bárbaras com coord destino no Set são puladas — evita duplicar farms já enviados manualmente.
+- **Validação de espiões antes da busca**: lê `Game.fetchAllUnits(groupId)` e filtra origens com `spy > 0`. Se zero, aborta com erro claro. Limita envios a `min(candidatas, totalSpies)`.
+- **Round-robin com fallback**: na busca, pra cada candidata tenta até `originsWithSpy.length` origens diferentes. Se uma origem retorna "tropas insuficientes", marca em `exhausted` e tenta a próxima. Quando todas esgotam, encerra cedo.
+- **Endpoint do mapa global**: `GET /map/village.txt` retorna CSV `id,name(URL-encoded),x,y,owner_id,points,?` com TODAS as aldeias do mundo. Owner = 0 → bárbara/bônus. ~3.5MB, cacheado em `Game._worldVillagesCache` (mundo não muda durante a sessão).
+- **`/map.php?v=2&x=X&y=Y` retorna `[]` no br142** — não usar pra sectors. `/map/village.txt` é o caminho.
+- **Catapulta na UI**: removida da grade editável (farm de bárbara não usa). Ao salvar, `tpl.units.catapult` é preservado do que estava no jogo (passa direto pelo `updateFarmTemplates`).
+- **Lock `busy` global**: `state.farmer.busy = true` durante `runFarmerCycle` ou `findNewBarbarians`. Bloqueia ciclo automático paralelo, botão "Executar agora", botão "Buscar". Persistido pra recovery; **zerado no boot** pelo `migrateFarmer` pra não travar após reload no meio.
+- **Recovery de timer**: `recoverFarmerSchedule()` no boot — se enabled antes do reload, agenda novo ciclo daqui a 1min (não imediato, pra evitar burst após restart).
 
 ---
 
@@ -206,6 +253,43 @@ Pra cada lead command (commandIndexInSource = 0):
 
 ---
 
+## 5d. Algoritmo do Farmador
+
+### Ciclo principal (`runFarmerCycle`)
+
+1. **Busy lock**: aborta se `state.farmer.busy` já é `true`. Marca `busy = true`.
+2. **Lê templates** via `Game.fetchFarmTemplates()` → `tplA`, `tplB`, `csrf`.
+3. **Lê origens** do grupo configurado.
+4. **Em paralelo**: `fetchFarmAssistantList(origins[0].id)` (bárbaras conhecidas) + `fetchOutgoingAttacks()` (Set de coords com ataque indo).
+5. **Pré-calcula plano**:
+   - `eligible = list.filter(t => !t.hadLosses && !outgoingAttacks.has(t.coords))`
+   - `planned = min(eligible × maxPerBarbarian, eligible × origens)`
+6. **Pra cada origem × bárbara conhecida**:
+   - Pula se `outgoingAttacks.has(coords)` (já tem ataque indo)
+   - Pula se `sentCount[villageId] >= maxPerBarbarian`
+   - Decide template: `hadLosses` → registra em wall-break + skip; `fullLoot` → B; default → A
+   - `Game.dispatchFarm()` com timing realista (`randomInRange(min, max)` ms)
+   - "Tropas insuficientes" → sai do loop interno, vai pra próxima origem
+7. **Finally**: `busy = false`, agenda próximo ciclo se não-manual.
+
+### Buscar bárbaras (`findNewBarbarians`)
+
+1. **Busy lock** (mesmo do ciclo).
+2. **Snapshot do modelo A** original.
+3. **Valida espiões disponíveis**: `fetchAllUnits(groupId)` → filtra origens com `spy > 0`. Aborta se zero.
+4. **Lista candidatas**: bárbaras (`owner === 0`) do mapa global (`fetchAllWorldVillages` cacheado), filtradas por:
+   - Distância ≤ `searchRadius` de qualquer origem
+   - Não já registradas no Assistente
+   - Não com ataque a caminho (via `fetchOutgoingAttacks`)
+5. **Limita envios** a `min(candidatas, totalSpies)`.
+6. **Troca modelo A** pra `{spy:1, resto:0}` via `updateFarmTemplates([spyA, B], csrf)`. Recarrega CSRF (jogo pode rotacionar).
+7. **Round-robin com fallback** entre origens-com-espião:
+   - Pra cada candidata, tenta até N origens diferentes a partir do cursor
+   - Origem "sem tropas" vai pra `exhausted`; `exhausted >= origins` → encerra cedo
+8. **Finally**: restaura modelo A (sempre, mesmo em erro). `busy = false`.
+
+---
+
 ## 6. Convenções de código
 
 - **Comentários**: só onde o "porquê" não é óbvio. Não comentar "o quê".
@@ -234,7 +318,9 @@ Pra cada lead command (commandIndexInSource = 0):
 - **Construtor**: módulo de fila de construção automática.
 - **Pesquisa**: módulo de pesquisa de unidades.
 - **Coleta em massa**: scavenge automatizado.
-- **Farm**: assistente de farm em bárbaras/inativas.
+- **Quebra de muralha**: módulo separado pra atacar bárbaras na lista `state.farmer.needsWallBreak` com aríetes/catapultas. Por ora o Farmador só **detecta** (`hadLosses`) e marca; não dispara.
+- **Farm de jogadores inativos**: hoje só bárbaras. Pra inativos, vai precisar usar `screen=place` direto (não tem entrada no Assistente nativo).
+- **Spy puro com troca temporária**: hoje, quando bárbara volta com perdas, o ciclo só registra wall-break sem mandar espião. Implementar troca temporária de A pra `{spy:1}` no ciclo (similar à Buscar bárbaras) pra confirmar a defesa antes de marcar.
 - **Cunhagem**: cunhar moedas com estoque mínimo.
 - **Balanceador de Recursos**: redistribuir via mercado.
 - **Configurações**: tema, posição do launcher, etc.
@@ -301,3 +387,76 @@ fetch('/interface.php?func=get_unit_info').then(r => r.text()).then(xml => {
   }
 });
 ```
+
+---
+
+## Apêndice B — Snippets do Assistente de Saque (am_farm)
+
+Quando um parser do Farmador quebrar:
+
+### Tabela de bárbaras conhecidas (`#plunder_list`)
+Cuidado: o jogo tem várias tabelas com coords (`main_layout` é layout externo). Filtre por **`id !== 'main_layout'`** e que **não contenham outras tabelas**:
+```js
+(async () => {
+  const html = await (await fetch('/game.php?village=' + game_data.village.id + '&screen=am_farm', { credentials: 'include' })).text();
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const tables = [...doc.querySelectorAll('table')]
+    .map(t => ({ t, rows: [...t.querySelectorAll('tr')].filter(tr => /\(\d{1,3}\|\d{1,3}\)/.test(tr.textContent)).length }))
+    .filter(x => x.rows >= 3 && x.t.id !== 'main_layout' && !x.t.querySelector('table'))
+    .sort((a, b) => b.rows - a.rows);
+  console.log('candidatas:', tables.length, 'tabela real:', tables[0]?.t.id);
+})();
+```
+Esperado: `id="plunder_list"`. Linhas no formato `<tr id="village_<ID>" class="report_<ID> row_a">`.
+
+### Form de modelos A/B (`action=edit_all`)
+```js
+const forms = [...document.forms].filter(f => /am_farm/.test(f.action || ''));
+forms.forEach((f, i) => console.log(i, f.action.slice(-100), [...f.querySelectorAll('input,select')].slice(0, 30).map(x => `${x.name}=${x.value}`)));
+```
+- O 1º form é o `action=edit_all`. **CSRF (`h`) vem na URL** (`...&h=<hash>`), NÃO como `<input>`. Extrair via regex.
+- Inputs no formato `template[<ID>][id]`, `template[<ID>][new]`, `<unit>[<ID>]`, `catapult_target[<ID>]`. Cada conta tem IDs próprios pros 2 modelos.
+
+### POST de disparar farm (Network tab)
+- Abre `screen=am_farm` no jogo
+- DevTools → Network → filtra XHR
+- Limpa lista, clica botão "A" de uma bárbara
+- Request: `POST /game.php?village=<source>&screen=am_farm&mode=farm&ajaxaction=farm&json=1`
+- Headers: `tribalwars-ajax: 1`, `x-requested-with: XMLHttpRequest`, `accept: application/json`
+- Body: `target=<targetVillageId>&template_id=<id>&source=<sourceVillageId>&h=<csrf>`
+
+### Mapa global (`/map/village.txt`)
+```js
+(async () => {
+  const t = await (await fetch('/map/village.txt', { credentials: 'include' })).text();
+  const lines = t.split('\n').filter(Boolean);
+  let barb = 0;
+  for (const l of lines) { if (l.split(',')[4] === '0') barb++; }
+  alert(`${lines.length} aldeias, ${barb} bárbaras (col[4]=0)`);
+})();
+```
+- Formato CSV: `id,name(URL-encoded),x,y,owner_id,points,?` — **owner está na coluna 4** (índice 4), não 6.
+- Owner = 0 → bárbara ou aldeia-bônus (ambas farmáveis).
+
+### Ícones de status no `#plunder_list`
+Inspecionar `<img>` em linhas reais:
+- **Saque cheio**: `src=".../max_loot/1.webp"` title="Saque máximo"
+- **Saque parcial**: `src=".../max_loot/0.webp"` title="Saque parcial: ..."
+- **Vitória total**: `src=".../dots/green.webp"` title="Vitória total"
+- **Vitória com perdas**: `src=".../dots/yellow.webp"`
+- **Derrota**: `src=".../dots/red.webp"`
+
+### Comandos saindo (ataques a caminho)
+```js
+(async () => {
+  const html = await (await fetch('/game.php?screen=place&mode=command', { credentials: 'include' })).text();
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const rows = doc.querySelectorAll('tr.command-row');
+  console.log('comandos:', rows.length);
+  if (rows[0]) console.log('1ª linha:', rows[0].outerHTML.slice(0, 1500));
+})();
+```
+- Tabela: `<table class="vis">` (sem id), linhas `<tr class="command-row">`
+- Cada linha tem `<span class="command_hover_details" data-command-type="attack|support|return">`
+- Texto do destino em `<span class="quickedit-label">Ataque a Foo (X|Y) Kxx</span>`
+- Filtro do Farmador: só `data-command-type="attack"` (cobre ataque normal + farm)

@@ -1798,6 +1798,18 @@
       text-transform: uppercase;
       font-weight: 700;
     }
+    .mog-side-status {
+      margin-left: auto;
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: #2a2b2b;
+      flex: 0 0 auto;
+      transition: background 0.2s, box-shadow 0.2s;
+    }
+    .mog-side-status.mog-side-status-on {
+      background: #4ade80;
+      box-shadow: 0 0 6px rgba(74, 222, 128, 0.6);
+    }
 
     /* main */
     .mog-main {
@@ -2986,6 +2998,7 @@
           <div class="mog-side-item mog-side-active" data-section="recruiter">
             <span class="mog-side-icon">⚔</span>
             <span>Recrutamento</span>
+            <span class="mog-side-status" data-status-for="recruiter"></span>
           </div>
           <div class="mog-side-item mog-side-disabled" data-section="research">
             <span class="mog-side-icon">⚗</span>
@@ -3004,10 +3017,12 @@
           <div class="mog-side-item" data-section="scheduler">
             <span class="mog-side-icon">⏰</span>
             <span>Agendador</span>
+            <span class="mog-side-status" data-status-for="scheduler"></span>
           </div>
           <div class="mog-side-item" data-section="dashboard">
             <span class="mog-side-icon">📊</span>
             <span>Painel</span>
+            <span class="mog-side-status" data-status-for="dashboard"></span>
           </div>
         </div>
       </div>
@@ -3021,6 +3036,7 @@
           <div class="mog-side-item" data-section="farmer">
             <span class="mog-side-icon"><img src="/graphic/unit/unit_light.png" alt="Farmador" onerror="this.style.display='none'"></span>
             <span>Farmador</span>
+            <span class="mog-side-status" data-status-for="farmer"></span>
           </div>
         </div>
       </div>
@@ -3171,7 +3187,35 @@
       renderPlaceholder(state.ui.activeSection);
     }
     renderLog();
+    refreshSidebarStatus();
   }
+
+  // Atualiza as bolinhas de status no sidebar. Cada item ativável pode estar
+  // ON (verde) ou OFF (cinza). Critérios:
+  //   - recruiter: bot global ligado E ao menos 1 profile com enabled=true
+  //   - scheduler/dashboard: ao menos 1 comando agendado/confirmando ainda pra ser enviado
+  //   - farmer: state.farmer.enabled
+  function refreshSidebarStatus() {
+    const recruiterOn = state.enabled && state.recruiter.profiles.some(p => p.enabled);
+    const farmerOn = !!state.farmer.enabled;
+    const hasScheduledCmd = state.scheduler.operations.some(op =>
+      Array.isArray(op.commands) && op.commands.some(c =>
+        c.status === 'scheduled' || c.status === 'confirming' || c.status === 'sending' || c.status === 'bundled' || c.status === 'pending'
+      )
+    );
+    const map = {
+      recruiter: recruiterOn,
+      farmer: farmerOn,
+      scheduler: hasScheduledCmd,
+      dashboard: hasScheduledCmd,
+    };
+    panel?.querySelectorAll('.mog-side-status[data-status-for]').forEach(el => {
+      const key = el.getAttribute('data-status-for');
+      el.classList.toggle('mog-side-status-on', !!map[key]);
+    });
+  }
+
+  setInterval(refreshSidebarStatus, 5000);
 
   function renderPlaceholder(section) {
     const labels = { builder: 'Construtor', research: 'Pesquisa' };

@@ -18,9 +18,3 @@ O script atualiza automaticamente pelo Tampermonkey. Para forçar uma atualizaç
 
 1. Abra o Tampermonkey → aba **Utilitários**
 2. Clique em **Verificar atualizações**
-
-## Funcionalidades
-
-- **Recrutador automático** — recruta tropas seguindo modelos configuráveis
-- **Agendador de ataques** — programa ataques com horário de chegada preciso
-- **Farmador automático** — farm de bárbaras via Assistente de Saque

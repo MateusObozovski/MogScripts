@@ -3,7 +3,8 @@
     "allow": [
       "Bash(git config *)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(node --check c:/Projetos/MogScripts/Mog.user.js)"
     ]
   }
 }

@@ -1,0 +1,5 @@
+node_modules/
+src/
+
+# O arquivo raiz original pode ser removido depois de mover pra src/
+Mog.user.js

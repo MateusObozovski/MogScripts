@@ -5540,11 +5540,16 @@
         });
         if (needScout.length > 0) {
           pushFarmerLog(`Modo seguro: espionando ${needScout.length} bárbara(s) sem dados.`);
+          updateFarmerProgress(0, needScout.length);
           try {
-            await scoutBarbarians(needScout, { logPrefix: 'espia' });
+            await scoutBarbarians(needScout, {
+              logPrefix: 'espia',
+              onProgress: (current, total) => updateFarmerProgress(current, total),
+            });
           } catch (e) {
             pushFarmerLog('Falha ao espionar: ' + e.message);
           }
+          updateFarmerProgress(0, 0);
         }
       }
 
@@ -5685,7 +5690,7 @@
   // params: targets = [{ villageId, x, y, coords, name? }, ...]
   // Retorna { dispatched, failed }. Restaura modelo A no finally.
   // Caller é responsável por gerenciar `state.farmer.busy`.
-  async function scoutBarbarians(targets, { logPrefix = 'espia' } = {}) {
+  async function scoutBarbarians(targets, { logPrefix = 'espia', onProgress } = {}) {
     if (targets.length === 0) return { dispatched: 0, failed: 0 };
     const f = state.farmer;
     let originalA = null, templatesSnapshot = null, csrf = null;
@@ -5740,6 +5745,7 @@
             cursor = (cursor + attempt + 1) % originsWithSpy.length;
             sent = true;
             pushFarmerLog(`[${dispatched}/${limit}] ${logPrefix}: ${origin.name} → ${t.coords}`);
+            if (typeof onProgress === 'function') onProgress(dispatched, limit);
             break;
           } catch (e) {
             const msg = e.message || String(e);
@@ -5849,7 +5855,10 @@
       if (candList.length === 0) return;
 
       updateFarmerProgress(0, candList.length);
-      const result = await scoutBarbarians(candList, { logPrefix: 'espia' });
+      const result = await scoutBarbarians(candList, {
+        logPrefix: 'espia',
+        onProgress: (current, total) => updateFarmerProgress(current, total),
+      });
       updateFarmerProgress(result.dispatched, candList.length);
       pushFarmerLog(`Busca concluída: ${result.dispatched}/${candList.length} espia(s) enviada(s).`);
       setTimeout(() => updateFarmerProgress(0, 0), 5000);

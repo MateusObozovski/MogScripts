@@ -204,6 +204,11 @@
       maxPerBarbarian: 1,
       searchRadius: 10,
       needsWallBreak: [],
+      // threats: ameaças detectadas via relatório de espionagem.
+      // Cada entry: { villageId, x, y, coords, wall, units: {spear, sword, ...}, away: {...}, scoutedAt, reportId }
+      // Bárbaras com wall>=1 OU qualquer tropa não-zero (units OR away) são bloqueadas pro farm.
+      // TTL: entradas com mais de THREAT_TTL_MS são consideradas vencidas (libera farm de novo).
+      threats: [],
       log: [],
       ui: { collapsed: {} },
       nextRunAt: 0,
@@ -296,6 +301,7 @@
     if (Number.isFinite(parsed.maxPerBarbarian)) base.maxPerBarbarian = parsed.maxPerBarbarian;
     if (Number.isFinite(parsed.searchRadius)) base.searchRadius = parsed.searchRadius;
     if (Array.isArray(parsed.needsWallBreak)) base.needsWallBreak = parsed.needsWallBreak;
+    if (Array.isArray(parsed.threats)) base.threats = parsed.threats;
     if (Array.isArray(parsed.log)) base.log = parsed.log;
     if (parsed.ui) base.ui = { ...base.ui, ...parsed.ui };
     if (Number.isFinite(parsed.nextRunAt)) base.nextRunAt = parsed.nextRunAt;
@@ -603,6 +609,14 @@
       return parseFarmAssistantList(html);
     },
 
+    // GET /game.php?screen=report&mode=all&view=<reportId> — lê 1 relatório individual.
+    // Retorna o HTML pra ser parseado por parseSpyReport.
+    async fetchReport(reportId) {
+      const url = `/game.php?screen=report&mode=all&view=${reportId}`;
+      const html = await fetch(url, { credentials: 'include' }).then(r => r.text());
+      return html;
+    },
+
     // GET /game.php?screen=place&mode=command — lista TODOS os comandos saindo do jogador.
     // Retorna Set<"x|y"> dos destinos que têm ataque/farm em curso.
     // Apoio e retornos NÃO entram (data-command-type !== "attack").
@@ -727,6 +741,86 @@
   // <span class="command_hover_details" data-command-type="attack|support|...">
   // e um <span class="quickedit-label"> com texto "Ataque a Foo (X|Y) Kxx".
   // Filtramos só ataques (inclui farm — type="attack" cobre os dois).
+  // Parsea um relatório de espionagem (screen=report&view=<id>).
+  // IDs estáveis no DOM:
+  //   #attack_info_def_units     → tropas presentes na bárbara
+  //   #attack_spy_away           → tropas fora da aldeia (também conta como "tem tropa")
+  //   #attack_spy_buildings_left/right → edifícios + nível (incluindo muralha)
+  // Retorna { units: {spear, sword, ...}, away: {...}, wall, buildings: [{key, name, level}], totalUnits, isSpyReport }
+  // Se o relatório não tiver as tabelas esperadas (ex: relatório de ataque puro sem espionagem),
+  // retorna isSpyReport=false. Caller deve ignorar.
+  function parseSpyReport(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const result = {
+      isSpyReport: false,
+      units: {},
+      away: {},
+      wall: 0,
+      buildings: [],
+      totalUnits: 0,
+      totalAway: 0,
+    };
+
+    const defTable = doc.querySelector('#attack_info_def_units');
+    const buildingsLeft = doc.querySelector('#attack_spy_buildings_left');
+    const awayTable = doc.querySelector('#attack_spy_away');
+    // só consideramos relatório de espionagem se conseguimos ler defesa OU edifícios
+    if (!defTable && !buildingsLeft) return result;
+    result.isSpyReport = true;
+
+    // tropas defendendo: tabela tem 2 linhas (header com data-unit + valores)
+    if (defTable) {
+      const headerCells = [...defTable.querySelectorAll('thead tr td, tbody tr:first-child td')];
+      const valueCells = [...defTable.querySelectorAll('tbody tr')].slice(1).flatMap(tr => [...tr.children]);
+      // mapeia cada coluna pelo data-unit do <a> dentro
+      headerCells.forEach((cell, i) => {
+        const unit = cell.querySelector('[data-unit]')?.getAttribute('data-unit');
+        if (!unit) return;
+        const val = parseInt(valueCells[i]?.textContent?.trim() || '0', 10) || 0;
+        result.units[unit] = val;
+        result.totalUnits += val;
+      });
+    }
+
+    // tropas fora da aldeia (mesma estrutura, dentro do #attack_spy_away)
+    if (awayTable) {
+      const innerTable = awayTable.querySelector('table.vis');
+      if (innerTable) {
+        const headerCells = [...innerTable.querySelectorAll('tr:first-child th')];
+        const valueCells = [...innerTable.querySelectorAll('tr')].slice(1).flatMap(tr => [...tr.children]);
+        headerCells.forEach((cell, i) => {
+          const unit = cell.querySelector('[data-unit]')?.getAttribute('data-unit');
+          if (!unit) return;
+          const val = parseInt(valueCells[i]?.textContent?.trim() || '0', 10) || 0;
+          result.away[unit] = val;
+          result.totalAway += val;
+        });
+      }
+    }
+
+    // edifícios + nível: itera ambas as tabelas left/right
+    const buildingTables = [
+      doc.querySelector('#attack_spy_buildings_left'),
+      doc.querySelector('#attack_spy_buildings_right'),
+    ].filter(Boolean);
+    for (const t of buildingTables) {
+      t.querySelectorAll('tbody tr').forEach(tr => {
+        const img = tr.querySelector('img[src*="/buildings/"]');
+        if (!img) return;
+        const m = img.getAttribute('src').match(/\/buildings\/(\w+)\.\w+/);
+        if (!m) return;
+        const key = m[1];
+        const name = tr.querySelector('span.middle')?.textContent.trim() || key;
+        const tds = tr.querySelectorAll('td');
+        const level = parseInt(tds[tds.length - 1]?.textContent.trim() || '0', 10) || 0;
+        result.buildings.push({ key, name, level });
+        if (key === 'wall') result.wall = level;
+      });
+    }
+
+    return result;
+  }
+
   function parseOutgoingAttacks(html) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const out = new Set();
@@ -2958,6 +3052,98 @@
     .mog-farm-wb-meta {
       font-size: 10px; color: #6b6b6b; margin-left: 6px;
     }
+
+    .mog-farm-empty {
+      padding: 24px;
+      text-align: center;
+      font-size: 12px; color: #888; font-style: italic;
+      background: #181919;
+      border: 1px solid #232424;
+      border-radius: 8px;
+      margin-bottom: 8px;
+    }
+
+    /* ---------- defenses ---------- */
+    .mog-def-legend {
+      display: flex; flex-wrap: wrap; gap: 14px;
+      align-items: center;
+      font-size: 11px; color: #aaa;
+    }
+    .mog-def-legend .mog-def-icon {
+      display: inline-block; margin-right: 4px;
+      filter: grayscale(0.2);
+    }
+    .mog-def-legend-meta {
+      flex: 1 1 100%;
+      font-size: 10.5px; color: #6b6b6b; font-style: italic;
+      margin-top: 4px;
+    }
+
+    .mog-def-block-expired { opacity: 0.6; }
+
+    .mog-def-table {
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    .mog-def-row {
+      display: grid;
+      grid-template-columns: 80px 60px 56px 1fr 1fr 70px 36px;
+      gap: 8px;
+      align-items: center;
+      padding: 6px 10px;
+      background: #141515;
+      border: 1px solid #2a2b2b;
+      border-radius: 5px;
+      font-size: 11px;
+    }
+    .mog-def-head {
+      background: transparent;
+      border: none;
+      padding: 4px 10px;
+      font-size: 10px; color: #6b6b6b;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      font-weight: 700;
+    }
+    .mog-def-coords a {
+      color: ${COLOR_ACCENT};
+      text-decoration: none;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+    .mog-def-coords a:hover { text-decoration: underline; }
+    .mog-def-type {
+      display: flex; gap: 4px; align-items: center;
+      font-size: 13px;
+    }
+    .mog-def-wall {
+      text-align: center;
+      font-weight: 700; color: #fff;
+      font-variant-numeric: tabular-nums;
+    }
+    .mog-def-empty {
+      color: #555; font-style: italic; font-size: 10.5px;
+    }
+    .mog-def-units {
+      display: flex; flex-wrap: wrap; gap: 4px 8px;
+    }
+    .mog-def-unit {
+      display: inline-flex; align-items: center; gap: 3px;
+      font-size: 10.5px; color: #cfcfcf;
+      font-variant-numeric: tabular-nums;
+    }
+    .mog-def-unit img {
+      width: 14px; height: 14px;
+      image-rendering: pixelated;
+    }
+    .mog-def-time {
+      font-size: 10px; color: #888;
+      text-align: center;
+      font-variant-numeric: tabular-nums;
+    }
+    .mog-def-rescout {
+      padding: 3px 8px;
+      font-size: 12px;
+    }
   `);
 
   // ---- DOM build ----
@@ -3037,6 +3223,10 @@
             <span class="mog-side-icon"><img src="/graphic/unit/unit_light.png" alt="Farmador" onerror="this.style.display='none'"></span>
             <span>Farmador</span>
             <span class="mog-side-status" data-status-for="farmer"></span>
+          </div>
+          <div class="mog-side-item" data-section="defenses">
+            <span class="mog-side-icon">🛡</span>
+            <span>Defesas</span>
           </div>
         </div>
       </div>
@@ -3165,7 +3355,7 @@
 
   panel.querySelector('#mog-log-clear').addEventListener('click', () => {
     if (state.ui.activeSection === 'scheduler' || state.ui.activeSection === 'dashboard') state.scheduler.log = [];
-    else if (state.ui.activeSection === 'farmer') state.farmer.log = [];
+    else if (state.ui.activeSection === 'farmer' || state.ui.activeSection === 'defenses') state.farmer.log = [];
     else state.recruiter.log = [];
     persist();
     renderLog();
@@ -3183,6 +3373,8 @@
       renderDashboard();
     } else if (state.ui.activeSection === 'farmer') {
       renderFarmer();
+    } else if (state.ui.activeSection === 'defenses') {
+      renderDefenses();
     } else {
       renderPlaceholder(state.ui.activeSection);
     }
@@ -5147,6 +5339,76 @@
     refreshFarmerHeader();
   }
 
+  // ---------- threats (defesas detectadas via espionagem) ----------
+
+  const THREAT_TTL_MS = 24 * 60 * 60 * 1000;     // 24h: depois libera farm de novo
+  const THREAT_REFRESH_MS = 5 * 60 * 1000;       // 5min: cache curto pra não re-fetar mesma bárbara em ciclos próximos
+
+  function getThreat(villageId) {
+    return state.farmer.threats.find(t => t.villageId === villageId);
+  }
+
+  function isThreatActive(t) {
+    if (!t) return false;
+    if (Date.now() - (t.scoutedAt || 0) > THREAT_TTL_MS) return false;
+    return (t.wall >= 1) || (t.totalUnits > 0) || (t.totalAway > 0);
+  }
+
+  function upsertThreat(entry) {
+    const i = state.farmer.threats.findIndex(t => t.villageId === entry.villageId);
+    if (i >= 0) state.farmer.threats[i] = entry;
+    else state.farmer.threats.push(entry);
+  }
+
+  // Lê relatórios de espionagem das bárbaras conhecidas e atualiza state.farmer.threats.
+  // Cache curto: pula bárbaras com entry < 5min.
+  // params: { force } — ignora cache, refaz tudo
+  async function refreshThreats(barbarianList, { force = false } = {}) {
+    const now = Date.now();
+    let updated = 0;
+    let skipped = 0;
+    for (const b of barbarianList) {
+      if (!b.reportId) continue;
+      const existing = getThreat(b.villageId);
+      if (!force && existing && (now - existing.scoutedAt) < THREAT_REFRESH_MS) {
+        skipped++;
+        continue;
+      }
+      try {
+        const html = await Game.fetchReport(b.reportId);
+        const parsed = parseSpyReport(html);
+        if (!parsed.isSpyReport) {
+          // último relatório não foi de espionagem (foi ataque sem explorador)
+          // mantém entrada antiga se houver, senão pula
+          continue;
+        }
+        upsertThreat({
+          villageId: b.villageId,
+          x: b.x, y: b.y,
+          coords: b.coords,
+          wall: parsed.wall,
+          units: parsed.units,
+          away: parsed.away,
+          totalUnits: parsed.totalUnits,
+          totalAway: parsed.totalAway,
+          buildings: parsed.buildings,
+          scoutedAt: now,
+          reportId: b.reportId,
+        });
+        updated++;
+      } catch (e) {
+        // erro lendo um relatório não bloqueia o resto
+      }
+      // pequeno delay pra não estressar o servidor
+      await sleep(150);
+    }
+    if (updated > 0 || skipped > 0) {
+      persist();
+      pushFarmerLog(`Relatórios: ${updated} atualizado(s), ${skipped} já em cache.`);
+    }
+    return { updated, skipped };
+  }
+
   // Itera bárbaras conhecidas, decide modelo (A normal, B saque cheio, A=spy se perdas)
   // e dispara via Game.dispatchFarm com timing realista. Lock global busy evita
   // ciclos sobrepostos.
@@ -5216,15 +5478,32 @@
         pushFarmerLog('Nenhuma bárbara registrada no assistente.');
         return;
       }
-      // 4. pré-calcula upper bound de envios. Exclui bárbaras com perdas e
-      // bárbaras que já têm ataque a caminho (não duplica esforço).
-      const eligible = list.filter(t => !t.hadLosses && !outgoingAttacks.has(t.coords));
+
+      // 3b. atualiza relatórios de espionagem (defesa/muralha) — cache curto evita re-fetch
+      try {
+        await refreshThreats(list);
+      } catch (e) {
+        pushFarmerLog('Aviso: falha ao atualizar relatórios: ' + e.message);
+      }
+
+      // 4. pré-calcula upper bound de envios. Exclui bárbaras com perdas, ataque
+      // a caminho ou defesa detectada (muralha ≥1 ou tropa).
+      const eligible = list.filter(t => {
+        if (t.hadLosses) return false;
+        if (outgoingAttacks.has(t.coords)) return false;
+        if (isThreatActive(getThreat(t.villageId))) return false;
+        return true;
+      });
       const skippedAlreadyAttacking = list.filter(t => !t.hadLosses && outgoingAttacks.has(t.coords)).length;
+      const skippedDefended = list.filter(t => !t.hadLosses && isThreatActive(getThreat(t.villageId))).length;
       const planned = Math.min(
         eligible.length * f.maxPerBarbarian,
         eligible.length * origins.length
       );
-      const extra = skippedAlreadyAttacking > 0 ? `, ${skippedAlreadyAttacking} já com ataque a caminho` : '';
+      const extras = [];
+      if (skippedAlreadyAttacking > 0) extras.push(`${skippedAlreadyAttacking} c/ ataque a caminho`);
+      if (skippedDefended > 0) extras.push(`${skippedDefended} c/ defesa detectada`);
+      const extra = extras.length ? `, ${extras.join(', ')}` : '';
       pushFarmerLog(`${origins.length} origem(ns), ${list.length} bárbara(s)${extra}, ~${planned} envio(s) planejado(s).`);
       updateFarmerProgress(0, planned);
 
@@ -5242,6 +5521,8 @@
           // pula bárbaras com ataque já a caminho (independente de origem) —
           // evita duplicar esforço com farms já enviados manualmente ou no ciclo anterior
           if (outgoingAttacks.has(target.coords)) continue;
+          // pula bárbaras com defesa detectada (muralha ≥1 ou tropa)
+          if (isThreatActive(getThreat(target.villageId))) continue;
           const c = sentCount.get(target.villageId) || 0;
           if (c >= f.maxPerBarbarian) continue;
 
@@ -5513,6 +5794,227 @@
     }
   }
 
+  // ---- defenses section ----
+
+  function renderDefenses() {
+    const threats = (state.farmer.threats || []).slice().sort((a, b) => {
+      // ordena por (tem_muralha desc, total tropa desc, coords)
+      const aSev = (a.wall || 0) * 1000 + (a.totalUnits || 0) + (a.totalAway || 0);
+      const bSev = (b.wall || 0) * 1000 + (b.totalUnits || 0) + (b.totalAway || 0);
+      return bSev - aSev || a.coords.localeCompare(b.coords);
+    });
+
+    const active = threats.filter(t => isThreatActive(t));
+    const expired = threats.filter(t => !isThreatActive(t));
+
+    content.innerHTML = `
+      <div class="mog-farm-head">
+        <h2>Defesas detectadas</h2>
+        <div class="mog-farm-toggle-wrap">
+          <button class="mog-farm-btn-ghost" id="mog-def-refresh" ${state.farmer.busy ? 'disabled' : ''}>
+            ↻ Atualizar relatórios
+          </button>
+        </div>
+      </div>
+
+      <div class="mog-farm-block">
+        <div class="mog-def-legend">
+          <span><span class="mog-def-icon">🧱</span> Muralha</span>
+          <span><span class="mog-def-icon">⚔</span> Tropas presentes</span>
+          <span><span class="mog-def-icon">🏃</span> Tropas fora</span>
+          <span class="mog-def-legend-meta">Bárbaras com muralha ≥ 1 ou qualquer tropa são bloqueadas pro farm. TTL de 24h — depois libera (espera novo relatório).</span>
+        </div>
+      </div>
+
+      ${active.length === 0 ? `
+        <div class="mog-farm-empty">Nenhuma bárbara com defesa detectada. Tudo limpo.</div>
+      ` : `
+        <div class="mog-farm-block mog-def-block">
+          <div class="mog-farm-block-title">Ativas (${active.length})</div>
+          ${renderDefensesTable(active)}
+        </div>
+      `}
+
+      ${expired.length === 0 ? '' : `
+        <div class="mog-farm-block mog-def-block mog-def-block-expired">
+          <div class="mog-farm-block-title">Vencidas (${expired.length}) — liberadas pro farm</div>
+          ${renderDefensesTable(expired)}
+        </div>
+      `}
+    `;
+
+    bindDefenses();
+  }
+
+  function renderDefensesTable(rows) {
+    return `
+      <div class="mog-def-table">
+        <div class="mog-def-row mog-def-head">
+          <div>Coords</div>
+          <div>Tipo</div>
+          <div>Muralha</div>
+          <div>Tropas presentes</div>
+          <div>Tropas fora</div>
+          <div>Espionada</div>
+          <div></div>
+        </div>
+        ${rows.map(t => renderDefenseRow(t)).join('')}
+      </div>
+    `;
+  }
+
+  function renderDefenseRow(t) {
+    const hasWall = (t.wall || 0) >= 1;
+    const hasUnits = (t.totalUnits || 0) > 0;
+    const hasAway = (t.totalAway || 0) > 0;
+    const typeIcons = [];
+    if (hasWall) typeIcons.push('<span title="Muralha">🧱</span>');
+    if (hasUnits) typeIcons.push('<span title="Tropas presentes">⚔</span>');
+    if (hasAway) typeIcons.push('<span title="Tropas fora">🏃</span>');
+    if (typeIcons.length === 0) typeIcons.push('<span title="Sem defesa" style="opacity:0.4">—</span>');
+
+    const unitsHtml = renderUnitsCompact(t.units);
+    const awayHtml = renderUnitsCompact(t.away);
+
+    const scoutedAgo = t.scoutedAt
+      ? formatAgo(Date.now() - t.scoutedAt)
+      : '—';
+
+    return `
+      <div class="mog-def-row" data-vid="${t.villageId}">
+        <div class="mog-def-coords">
+          <a href="/game.php?village=${unsafeWindow.game_data.village.id}&screen=info_village&id=${t.villageId}" target="_blank">${t.coords}</a>
+        </div>
+        <div class="mog-def-type">${typeIcons.join(' ')}</div>
+        <div class="mog-def-wall">${t.wall || 0}</div>
+        <div>${unitsHtml}</div>
+        <div>${awayHtml}</div>
+        <div class="mog-def-time">${scoutedAgo}</div>
+        <div>
+          <button class="mog-farm-btn-ghost mog-def-rescout" data-vid="${t.villageId}" ${state.farmer.busy ? 'disabled' : ''}>↻</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderUnitsCompact(unitsMap) {
+    if (!unitsMap) return '<span class="mog-def-empty">—</span>';
+    const entries = FARMER_UNIT_KEYS
+      .map(k => ({ k, v: unitsMap[k] || 0 }))
+      .filter(e => e.v > 0);
+    if (entries.length === 0) return '<span class="mog-def-empty">—</span>';
+    return `<div class="mog-def-units">${
+      entries.map(e => {
+        const name = (UNITS.find(u => u.id === e.k) || COMMAND_UNITS.find(u => u.id === e.k))?.name || e.k;
+        return `<span class="mog-def-unit" title="${name}: ${e.v}"><img src="${unitImgSrc(e.k)}" onerror="this.style.display='none'">${e.v}</span>`;
+      }).join('')
+    }</div>`;
+  }
+
+  function formatAgo(ms) {
+    if (ms < 60 * 1000) return 'agora';
+    const min = Math.floor(ms / 60000);
+    if (min < 60) return `${min}min`;
+    const h = Math.floor(min / 60);
+    if (h < 24) return `${h}h`;
+    const d = Math.floor(h / 24);
+    return `${d}d`;
+  }
+
+  function bindDefenses() {
+    const refresh = content.querySelector('#mog-def-refresh');
+    if (refresh) refresh.addEventListener('click', refreshDefensesNow);
+    content.querySelectorAll('.mog-def-rescout').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const vid = parseInt(btn.dataset.vid, 10);
+        rescoutVillage(vid);
+      });
+    });
+  }
+
+  async function refreshDefensesNow() {
+    if (state.farmer.busy) return;
+    state.farmer.busy = true;
+    persist();
+    refreshFarmerHeader();
+    pushFarmerLog('Atualizando relatórios manualmente...');
+    try {
+      const origins = await Game.fetchGroupVillages(state.farmer.groupId);
+      if (!origins.length) throw new Error('grupo sem aldeias');
+      const list = await Game.fetchFarmAssistantList(origins[0].id);
+      await refreshThreats(list, { force: true });
+      pushFarmerLog('Relatórios atualizados.');
+    } catch (e) {
+      pushFarmerLog('Falha ao atualizar: ' + e.message);
+    } finally {
+      state.farmer.busy = false;
+      persist();
+      refreshFarmerHeader();
+      if (state.ui.activeSection === 'defenses') renderDefenses();
+    }
+  }
+
+  async function rescoutVillage(villageId) {
+    if (state.farmer.busy) return;
+    const t = getThreat(villageId);
+    if (!t) return;
+    state.farmer.busy = true;
+    persist();
+    refreshFarmerHeader();
+    pushFarmerLog(`Reespionando ${t.coords}...`);
+
+    let originalA = null, templatesSnapshot = null, csrf = null;
+    try {
+      const tplData = await Game.fetchFarmTemplates();
+      if (!tplData.templates.length) throw new Error('sem modelos');
+      templatesSnapshot = tplData.templates;
+      csrf = tplData.csrf;
+      originalA = { ...templatesSnapshot[0], units: { ...templatesSnapshot[0].units } };
+
+      // origem com espião disponível
+      const origins = await Game.fetchGroupVillages(state.farmer.groupId);
+      const units = await Game.fetchAllUnits(state.farmer.groupId);
+      const withSpy = origins.find(o => (units.get(String(o.id))?.spy || 0) > 0);
+      if (!withSpy) throw new Error('nenhuma aldeia tem espião');
+
+      // troca A pra spy=1, dispara, restaura
+      const spyTpl = {
+        id: originalA.id,
+        units: Object.fromEntries(FARMER_UNIT_KEYS.map(k => [k, k === 'spy' ? 1 : 0])),
+        catapultTarget: originalA.catapultTarget,
+      };
+      spyTpl.units.catapult = 0;
+      await Game.updateFarmTemplates({ templates: [spyTpl, templatesSnapshot[1]].filter(Boolean), csrf });
+      const refreshed = await Game.fetchFarmTemplates();
+      csrf = refreshed.csrf;
+
+      await Game.dispatchFarm({
+        sourceVillageId: withSpy.id,
+        targetVillageId: villageId,
+        templateId: originalA.id,
+        csrf,
+      });
+      pushFarmerLog(`espia: ${withSpy.name} → ${t.coords}`);
+    } catch (e) {
+      pushFarmerLog(`falha rescout: ${e.message}`);
+    } finally {
+      // restaura modelo A
+      if (originalA && csrf && templatesSnapshot) {
+        try {
+          await Game.updateFarmTemplates({
+            templates: [originalA, templatesSnapshot[1]].filter(Boolean),
+            csrf,
+          });
+        } catch (e) {
+          pushFarmerLog('AVISO: falha ao restaurar modelo A: ' + e.message);
+        }
+      }
+      state.farmer.busy = false;
+      persist();
+      refreshFarmerHeader();
+    }
+  }
+
   // ---- recruiter section ----
   function renderRecruiter() {
     const profiles = state.recruiter.profiles;
@@ -5738,7 +6240,7 @@
   // ---- log render ----
   function getActiveLog() {
     if (state.ui.activeSection === 'scheduler' || state.ui.activeSection === 'dashboard') return state.scheduler.log;
-    if (state.ui.activeSection === 'farmer') return state.farmer.log;
+    if (state.ui.activeSection === 'farmer' || state.ui.activeSection === 'defenses') return state.farmer.log;
     return state.recruiter.log;
   }
 

@@ -178,6 +178,10 @@
 
   const DEFAULT_STATE = {
     enabled: false,
+    // Timestamp do último captcha detectado. Quando >0, bot fica em "modo trava":
+    // tudo desligado, recovery não re-agenda nada, banner de aviso no painel.
+    // Usuário precisa logar manualmente no TW e clicar Ativo no toggle global pra zerar.
+    captchaTrippedAt: 0,
     ui: {
       activeSection: 'recruiter',
       expandedProfileId: null,
@@ -318,6 +322,7 @@
   function migrateState(parsed) {
     const base = structuredClone(DEFAULT_STATE);
     base.enabled = parsed.enabled ?? false;
+    if (Number.isFinite(parsed.captchaTrippedAt)) base.captchaTrippedAt = parsed.captchaTrippedAt;
     if (parsed.ui) base.ui = { ...base.ui, ...parsed.ui };
     base.scheduler = migrateScheduler(parsed.scheduler);
     base.farmer = migrateFarmer(parsed.farmer);
@@ -347,6 +352,242 @@
 
   let state = loadState();
   const persist = () => saveState(state);
+
+  // ---------- captcha guard ----------
+  // Detecta captcha (botcheck) do TW e desliga TUDO + faz logout pra evitar ban.
+  // Heurísticas redundantes (DOM, URL, fetch responses) — prefere falso-positivo.
+  let captchaHandled = false;     // garante que trip() roda só 1x
+
+  // Marcadores típicos do hCaptcha/botprotection no TW
+  const CAPTCHA_DOM_SELECTORS = [
+    '[id*="botprotect"]',
+    '[id*="bot_check"]',
+    '[id*="botcheck"]',
+    '[class*="botprotect"]',
+    '[id*="hcaptcha"]:not([style*="display: none"])',
+    'iframe[src*="hcaptcha.com"]',
+  ];
+  const CAPTCHA_HTML_PATTERNS = [
+    /bot_protection_active/i,
+    /bot[\s_-]*protection/i,
+    /botcheck/i,
+    /screen=bot_protection/i,
+    /h-captcha/i,
+    /hcaptcha\.com\/captcha/i,
+  ];
+  const CAPTCHA_URL_PATTERNS = [
+    /screen=bot_protection/i,
+    /botprotection/i,
+  ];
+
+  function isHcaptchaIframeVisible(el) {
+    // pra evitar falso positivo de iframe pré-carregado escondido
+    if (!el) return false;
+    const rect = el.getBoundingClientRect?.();
+    if (!rect) return true;     // sem layout, considera visível por segurança
+    if (rect.width === 0 && rect.height === 0) return false;
+    const style = unsafeWindow.getComputedStyle?.(el);
+    if (style?.display === 'none' || style?.visibility === 'hidden') return false;
+    return true;
+  }
+
+  function checkDomForCaptcha() {
+    for (const sel of CAPTCHA_DOM_SELECTORS) {
+      const el = document.querySelector(sel);
+      if (!el) continue;
+      // iframes podem estar pré-carregados invisíveis; só dispara se visível
+      if (el.tagName === 'IFRAME' && !isHcaptchaIframeVisible(el)) continue;
+      return `DOM: ${sel}`;
+    }
+    return null;
+  }
+
+  function checkUrlForCaptcha() {
+    const url = unsafeWindow.location?.href || '';
+    for (const re of CAPTCHA_URL_PATTERNS) {
+      if (re.test(url)) return `URL: ${url}`;
+    }
+    return null;
+  }
+
+  function checkResponseForCaptcha(text, url) {
+    if (!text) return null;
+    // limita a inspecionar só os primeiros 5000 chars pra performance
+    const sample = text.slice(0, 5000);
+    for (const re of CAPTCHA_HTML_PATTERNS) {
+      if (re.test(sample)) return `RESP ${url}: ${re}`;
+    }
+    return null;
+  }
+
+  // Trip único: para tudo, persiste flag, logout, banner. Idempotente.
+  function tripCaptcha(reason) {
+    if (captchaHandled) return;
+    captchaHandled = true;
+    state.captchaTrippedAt = Date.now();
+    state.enabled = false;
+    if (state.farmer) {
+      state.farmer.enabled = false;
+      state.farmer.busy = false;
+      state.farmer.nextRunAt = 0;
+    }
+    if (Array.isArray(state.recruiter?.profiles)) {
+      state.recruiter.profiles.forEach(p => { p.nextRunAt = 0; });
+    }
+    persist();
+
+    // limpa todos os timers conhecidos. Cada engine tem o seu Map/var.
+    try {
+      if (typeof profileTimers !== 'undefined' && profileTimers.clear) {
+        profileTimers.forEach(t => clearTimeout(t));
+        profileTimers.clear();
+      }
+    } catch {}
+    try { if (typeof farmerTimerId !== 'undefined') clearTimeout(farmerTimerId); } catch {}
+    try {
+      if (typeof commandTimers !== 'undefined' && commandTimers.clear) {
+        commandTimers.forEach(t => clearTimeout(t));
+        commandTimers.clear();
+      }
+    } catch {}
+    try {
+      if (typeof prepareTimers !== 'undefined' && prepareTimers.clear) {
+        prepareTimers.forEach(t => clearTimeout(t));
+        prepareTimers.clear();
+      }
+    } catch {}
+
+    // log + banner + logout
+    try {
+      const ts = new Date().toLocaleTimeString('pt-BR');
+      const entry = `[${ts}] 🚨 CAPTCHA DETECTADO (${reason}) — bot parado e logout disparado.`;
+      if (state.recruiter) {
+        state.recruiter.log = state.recruiter.log || [];
+        state.recruiter.log.unshift(entry);
+        state.recruiter.log = state.recruiter.log.slice(0, 200);
+      }
+      if (state.farmer) {
+        state.farmer.log = state.farmer.log || [];
+        state.farmer.log.unshift(entry);
+        state.farmer.log = state.farmer.log.slice(0, 200);
+      }
+      if (state.scheduler) {
+        state.scheduler.log = state.scheduler.log || [];
+        state.scheduler.log.unshift(entry);
+        state.scheduler.log = state.scheduler.log.slice(0, 500);
+      }
+      persist();
+    } catch {}
+
+    showCaptchaBanner(reason);
+
+    // logout: dispara request E redireciona pra garantir que sessão fecha
+    setTimeout(() => {
+      try {
+        unsafeWindow.location.href = '/logout.php';
+      } catch {
+        try { unsafeWindow.location.replace('/logout.php'); } catch {}
+      }
+    }, 1500);     // 1.5s pra usuário ver o banner antes de redirecionar
+  }
+
+  function showCaptchaBanner(reason) {
+    // banner full-screen vermelho, não-fechável, sobrepõe tudo
+    if (document.getElementById('mog-captcha-banner')) return;
+    const div = document.createElement('div');
+    div.id = 'mog-captcha-banner';
+    div.style.cssText = [
+      'position:fixed', 'inset:0', 'z-index:2147483647',
+      'background:rgba(120,15,15,0.96)',
+      'color:#fff', 'font-family:system-ui,sans-serif',
+      'display:flex', 'align-items:center', 'justify-content:center',
+      'flex-direction:column', 'gap:18px', 'padding:40px',
+      'text-align:center',
+    ].join(';');
+    div.innerHTML = `
+      <div style="font-size:56px;line-height:1;">🚨</div>
+      <div style="font-size:24px;font-weight:700;letter-spacing:0.5px;">CAPTCHA DETECTADO</div>
+      <div style="font-size:14px;max-width:520px;line-height:1.5;color:#ffe6e6;">
+        O Tribal Wars solicitou verificação humana. Pra evitar banimento, o bot foi
+        desligado e o jogo será deslogado em instantes.<br><br>
+        Quando voltar a jogar, faça login novamente e ative o bot pelo toggle.
+      </div>
+      <div style="font-size:11px;color:#ffaaaa;font-family:monospace;opacity:0.7;">
+        gatilho: ${escapeHtmlForBanner(reason)}
+      </div>
+    `;
+    document.body.appendChild(div);
+  }
+
+  function escapeHtmlForBanner(s) {
+    return String(s).replace(/[&<>"]/g, c => ({
+      '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;',
+    }[c]));
+  }
+
+  function startCaptchaWatcher() {
+    // se já trippado, não monitora — usuário precisa reativar manualmente
+    if (state.captchaTrippedAt > 0 && !state.enabled && !state.farmer?.enabled) {
+      // nada a fazer; toggle global limpa flag quando user reativar
+    }
+
+    // 1. observa DOM
+    const obs = new MutationObserver(() => {
+      if (captchaHandled) return;
+      const hit = checkDomForCaptcha();
+      if (hit) tripCaptcha(hit);
+    });
+    obs.observe(document.body, { childList: true, subtree: true });
+
+    // 2. verifica URL agora (caso já tenhamos sido redirecionados)
+    const urlHit = checkUrlForCaptcha();
+    if (urlHit) { tripCaptcha(urlHit); return; }
+
+    // 3. verifica DOM agora
+    const domHit = checkDomForCaptcha();
+    if (domHit) { tripCaptcha(domHit); return; }
+
+    // 4. wrapper em fetch global pra inspecionar respostas. Não toca em XHR
+    // legado nem em sendBeacon — fetch cobre 99% do TW moderno.
+    const origFetch = unsafeWindow.fetch.bind(unsafeWindow);
+    unsafeWindow.fetch = async function (...args) {
+      const res = await origFetch(...args);
+      if (captchaHandled) return res;
+      try {
+        // só inspeciona requests pro mesmo domínio (TW). Evita ler hcaptcha.com etc.
+        const reqUrl = (typeof args[0] === 'string' ? args[0] : args[0]?.url) || '';
+        if (reqUrl && !/^https?:\/\//.test(reqUrl) || reqUrl.includes('tribalwars.com.br')) {
+          // clona resposta pra não consumir o body do caller
+          const clone = res.clone();
+          const ct = clone.headers.get('content-type') || '';
+          if (/text\/html|application\/json|text\/plain/i.test(ct)) {
+            const text = await clone.text();
+            const hit = checkResponseForCaptcha(text, reqUrl);
+            if (hit) tripCaptcha(hit);
+          }
+        }
+      } catch {}
+      return res;
+    };
+
+    // 5. periodicamente verifica URL (caso navegação interna do TW troque sem MutationObserver pegar)
+    setInterval(() => {
+      if (captchaHandled) return;
+      const u = checkUrlForCaptcha();
+      if (u) tripCaptcha(u);
+    }, 5000);
+  }
+
+  // se já estamos trippados (state persistido com flag), mostra banner e bloqueia
+  // qualquer auto-start. Usuário tem que clicar no toggle global pra zerar.
+  if (state.captchaTrippedAt > 0) {
+    captchaHandled = true;     // bloqueia trip duplo, mas auto-start já é bloqueado pelo enabled=false
+    // banner aparece quando o body estiver pronto
+    if (document.body) showCaptchaBanner('flag persistida — desative manualmente');
+    else document.addEventListener('DOMContentLoaded', () => showCaptchaBanner('flag persistida — desative manualmente'));
+  }
+
+  startCaptchaWatcher();
 
   // ---------- game api ----------
   const Game = {
@@ -1306,6 +1547,13 @@
   }
 
   function startGlobal() {
+    // reativar limpa flag de captcha — usuário voltou a logar e quer rodar de novo
+    if (state.captchaTrippedAt > 0) {
+      state.captchaTrippedAt = 0;
+      const banner = document.getElementById('mog-captcha-banner');
+      if (banner) banner.remove();
+      pushLog('Flag de captcha limpa — bot reativado.');
+    }
     state.enabled = true;
     persist();
     state.recruiter.profiles.forEach(p => {

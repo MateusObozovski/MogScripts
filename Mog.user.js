@@ -510,13 +510,30 @@
       <div style="font-size:14px;max-width:520px;line-height:1.5;color:#ffe6e6;">
         O Tribal Wars solicitou verificação humana. Pra evitar banimento, o bot foi
         desligado e o jogo será deslogado em instantes.<br><br>
-        Quando voltar a jogar, faça login novamente e ative o bot pelo toggle.
+        Quando voltar a jogar, faça login novamente e clique abaixo pra reativar o bot.
       </div>
+      <button id="mog-captcha-reactivate" style="
+        background:#fff;color:#7a1a1a;border:none;
+        padding:12px 24px;border-radius:6px;
+        font-size:13px;font-weight:700;cursor:pointer;
+        letter-spacing:0.4px;text-transform:uppercase;
+        transition:filter 0.15s;
+      ">✓ Já estou logado, reativar bot</button>
       <div style="font-size:11px;color:#ffaaaa;font-family:monospace;opacity:0.7;">
         gatilho: ${escapeHtmlForBanner(reason)}
       </div>
     `;
     document.body.appendChild(div);
+    const btn = div.querySelector('#mog-captcha-reactivate');
+    if (btn) {
+      btn.addEventListener('click', () => {
+        // limpa flag, remove banner, reativa observer
+        state.captchaTrippedAt = 0;
+        captchaHandled = false;
+        persist();
+        div.remove();
+      });
+    }
   }
 
   function escapeHtmlForBanner(s) {
@@ -5332,9 +5349,6 @@
           <div class="mog-farm-progress-bar"><div class="mog-farm-progress-fill" id="mog-farm-progress-fill"></div></div>
           <div class="mog-farm-progress-text" id="mog-farm-progress-text">0 / 0</div>
         </div>
-        <button class="mog-farm-btn-ghost" id="mog-farm-test-captcha" style="margin-top:8px;width:100%;border-color:#7a3030;color:#e87b65;">
-          🚨 Testar captcha guard (DEV)
-        </button>
       </div>
 
       ${wbBlock}

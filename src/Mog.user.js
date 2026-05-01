@@ -5332,6 +5332,9 @@
           <div class="mog-farm-progress-bar"><div class="mog-farm-progress-fill" id="mog-farm-progress-fill"></div></div>
           <div class="mog-farm-progress-text" id="mog-farm-progress-text">0 / 0</div>
         </div>
+        <button class="mog-farm-btn-ghost" id="mog-farm-test-captcha" style="margin-top:8px;width:100%;border-color:#7a3030;color:#e87b65;">
+          🚨 Testar captcha guard (DEV)
+        </button>
       </div>
 
       ${wbBlock}
@@ -5500,6 +5503,13 @@
       searchBtn.addEventListener('click', () => {
         if (state.farmer.busy) return;
         findNewBarbarians();
+      });
+    }
+    const testCaptchaBtn = root.querySelector('#mog-farm-test-captcha');
+    if (testCaptchaBtn) {
+      testCaptchaBtn.addEventListener('click', () => {
+        if (!confirm('Teste do captcha guard. Vai parar tudo, mostrar banner vermelho e deslogar do TW em 1.5s. Continuar?')) return;
+        tripCaptcha('teste manual via botão DEV');
       });
     }
   }

@@ -211,6 +211,10 @@
       // Quando ON, ciclo espiona bárbaras sem threats ativo antes de farmar (+1 ciclo de espera).
       // Default ON pra evitar perdas com bárbaras nunca espionadas.
       safeMode: true,
+      // Janela mínima entre chegadas de farms na mesma bárbara (minutos).
+      // Default 10min pra dar tempo da bárbara regenerar saque entre ataques.
+      // Aplicado quando conseguimos parsear o horário de chegada dos comandos.
+      arrivalWindowMin: 10,
       needsWallBreak: [],
       // threats: ameaças detectadas via relatório de espionagem.
       // Cada entry: { villageId, x, y, coords, wall, units: {spear, sword, ...}, away: {...}, scoutedAt, reportId }
@@ -309,6 +313,7 @@
     if (Number.isFinite(parsed.maxPerBarbarian)) base.maxPerBarbarian = parsed.maxPerBarbarian;
     if (Number.isFinite(parsed.searchRadius)) base.searchRadius = parsed.searchRadius;
     if (typeof parsed.safeMode === 'boolean') base.safeMode = parsed.safeMode;
+    if (Number.isFinite(parsed.arrivalWindowMin)) base.arrivalWindowMin = parsed.arrivalWindowMin;
     if (Array.isArray(parsed.needsWallBreak)) base.needsWallBreak = parsed.needsWallBreak;
     if (Array.isArray(parsed.threats)) base.threats = parsed.threats;
     if (Array.isArray(parsed.log)) base.log = parsed.log;
@@ -1084,16 +1089,23 @@
     return result;
   }
 
+  // Retorna Map<"x|y", count> de ataques saindo agora.
+  // Por que Map em vez de Set: precisamos saber QUANTOS ataques estão indo
+  // pra cada coord, não só "tem ou não tem". Bárbaras somem do #plunder_list
+  // enquanto há comando indo, então essa é nossa fonte canônica de "quantos
+  // farms já mandei pra X|Y" — sobrevive ao desaparecimento da bárbara da AS.
   function parseOutgoingAttacks(html) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
-    const out = new Set();
+    const out = new Map();
     doc.querySelectorAll('tr.command-row').forEach(tr => {
       const detail = tr.querySelector('[data-command-type]');
       if (!detail) return;
       if (detail.getAttribute('data-command-type') !== 'attack') return;
       const label = tr.querySelector('.quickedit-label')?.textContent || tr.textContent || '';
       const m = label.match(/\((\d{1,3})\|(\d{1,3})\)/);
-      if (m) out.add(`${m[1]}|${m[2]}`);
+      if (!m) return;
+      const coord = `${m[1]}|${m[2]}`;
+      out.set(coord, (out.get(coord) || 0) + 1);
     });
     return out;
   }
@@ -5761,19 +5773,25 @@
         return;
       }
 
-      // 3. lê tabela de bárbaras conhecidas + ataques saindo (pra evitar duplicar farms)
+      // 3. lê tabela de bárbaras conhecidas + ataques saindo + tropas das origens
       let list;
-      let outgoingAttacks = new Set();
+      let outgoingAttacks = new Map();
+      let unitsByVillage = new Map();
       try {
-        const [knownList, outgoing] = await Promise.all([
+        const [knownList, outgoing, units] = await Promise.all([
           Game.fetchFarmAssistantList(origins[0].id),
           Game.fetchOutgoingAttacks().catch(e => {
             pushFarmerLog('Aviso: falha ao ler comandos saindo: ' + e.message);
-            return new Set();
+            return new Map();
+          }),
+          Game.fetchAllUnits(f.groupId).catch(e => {
+            pushFarmerLog('Aviso: falha ao ler tropas das origens: ' + e.message);
+            return new Map();
           }),
         ]);
         list = knownList;
         outgoingAttacks = outgoing;
+        unitsByVillage = units;
       } catch (e) {
         pushFarmerLog('Falha ao ler bárbaras do assistente: ' + e.message);
         return;
@@ -5783,6 +5801,33 @@
         return;
       }
 
+      // 3a. snapshot mutável de tropa por origem. A cada farm enviado, subtraímos
+      // do snapshot pra evitar mandar request que vai falhar com "tropas insuficientes".
+      // Chave = villageId (string, igual ao retornado por fetchAllUnits).
+      const originUnits = new Map();
+      for (const o of origins) {
+        const u = unitsByVillage.get(String(o.id)) || {};
+        originUnits.set(o.id, { ...u });    // copia pra mutar livre
+      }
+
+      // helper: origem tem tropa suficiente pra disparar esse template?
+      const hasTroopsFor = (originId, tpl) => {
+        const u = originUnits.get(originId);
+        if (!u) return false;
+        for (const [unitId, qty] of Object.entries(tpl.units || {})) {
+          if (qty > 0 && (u[unitId] || 0) < qty) return false;
+        }
+        return true;
+      };
+      // helper: subtrai o template das tropas (só chamar após dispatch bem-sucedido)
+      const subtractTroopsFor = (originId, tpl) => {
+        const u = originUnits.get(originId);
+        if (!u) return;
+        for (const [unitId, qty] of Object.entries(tpl.units || {})) {
+          if (qty > 0) u[unitId] = Math.max(0, (u[unitId] || 0) - qty);
+        }
+      };
+
       // 3b. atualiza relatórios de espionagem (defesa/muralha) — cache curto evita re-fetch
       try {
         await refreshThreats(list);
@@ -5790,18 +5835,29 @@
         pushFarmerLog('Aviso: falha ao atualizar relatórios: ' + e.message);
       }
 
+      // helper: quantos farms já estão indo pra essa coord (vivem em
+      // overview_villages?screen=place&mode=command, fonte canônica que
+      // sobrevive ao desaparecimento da bárbara do AS).
+      const attacksGoingTo = (coords) => outgoingAttacks.get(coords) || 0;
+      // helper: quantos farms ainda cabem nessa bárbara antes de atingir maxPerBarbarian
+      // somando o que já está indo + o que já enviamos neste ciclo
+      const slotsAvailable = (target, sentThisCycle = 0) => {
+        const going = attacksGoingTo(target.coords);
+        return Math.max(0, f.maxPerBarbarian - going - sentThisCycle);
+      };
+
       // 3c. modo seguro: bárbaras sem threat seguro (sem espionagem ou vencida)
       // são espionadas ANTES do dispatch. Próximo ciclo farma com confiança.
-      // Excluí: bárbaras com defesa detectada, com ataque a caminho, ou já com
+      // Excluí: bárbaras com defesa detectada, com slots cheios, ou já com
       // threat seguro recente.
       if (f.safeMode) {
         const needScout = list.filter(t => {
           if (t.hadLosses) return false;
-          if (outgoingAttacks.has(t.coords)) return false;
+          if (slotsAvailable(t) <= 0) return false;     // já tem ataques suficientes indo
           const th = getThreat(t.villageId);
-          if (isThreatActive(th)) return false;     // já sabemos que tem defesa
-          if (isThreatSafe(th)) return false;        // já sabemos que está limpa
-          return true;                                // sem dados → espionar
+          if (isThreatActive(th)) return false;
+          if (isThreatSafe(th)) return false;
+          return true;
         });
         if (needScout.length > 0) {
           pushFarmerLog(`Modo seguro: espionando ${needScout.length} bárbara(s) sem dados.`);
@@ -5818,30 +5874,29 @@
         }
       }
 
-      // 4. pré-calcula upper bound de envios. Exclui:
-      //   - bárbaras com perdas
-      //   - ataque a caminho
-      //   - defesa detectada (wall ou tropa)
-      //   - safeMode + sem threat seguro (sem espionagem ou vencida)
+      // 4. pré-calcula upper bound de envios. Bárbara é elegível se:
+      //   - não tem perdas
+      //   - tem ao menos 1 slot livre (going + sent < maxPerBarbarian)
+      //   - sem defesa detectada
+      //   - safeMode → tem threat seguro recente
       const eligible = list.filter(t => {
         if (t.hadLosses) return false;
-        if (outgoingAttacks.has(t.coords)) return false;
+        if (slotsAvailable(t) <= 0) return false;
         const th = getThreat(t.villageId);
         if (isThreatActive(th)) return false;
         if (f.safeMode && !isThreatSafe(th)) return false;
         return true;
       });
-      const skippedAlreadyAttacking = list.filter(t => !t.hadLosses && outgoingAttacks.has(t.coords)).length;
-      const skippedDefended = list.filter(t => !t.hadLosses && isThreatActive(getThreat(t.villageId))).length;
+      const skippedFull = list.filter(t => !t.hadLosses && slotsAvailable(t) <= 0).length;
+      const skippedDefended = list.filter(t => !t.hadLosses && slotsAvailable(t) > 0 && isThreatActive(getThreat(t.villageId))).length;
       const skippedNoScout = f.safeMode
-        ? list.filter(t => !t.hadLosses && !outgoingAttacks.has(t.coords) && !isThreatActive(getThreat(t.villageId)) && !isThreatSafe(getThreat(t.villageId))).length
+        ? list.filter(t => !t.hadLosses && slotsAvailable(t) > 0 && !isThreatActive(getThreat(t.villageId)) && !isThreatSafe(getThreat(t.villageId))).length
         : 0;
-      const planned = Math.min(
-        eligible.length * f.maxPerBarbarian,
-        eligible.length * origins.length
-      );
+      // soma slots livres por bárbara elegível (não só count*1)
+      const totalSlots = eligible.reduce((acc, t) => acc + slotsAvailable(t), 0);
+      const planned = Math.min(totalSlots, eligible.length * origins.length);
       const extras = [];
-      if (skippedAlreadyAttacking > 0) extras.push(`${skippedAlreadyAttacking} c/ ataque a caminho`);
+      if (skippedFull > 0) extras.push(`${skippedFull} já com ataques suficientes`);
       if (skippedDefended > 0) extras.push(`${skippedDefended} c/ defesa detectada`);
       if (skippedNoScout > 0) extras.push(`${skippedNoScout} aguardando relatório`);
       const extra = extras.length ? `, ${extras.join(', ')}` : '';
@@ -5859,22 +5914,19 @@
 
         for (const target of list) {
           if (!manual && !state.farmer.enabled) break;
-          // pula bárbaras com ataque já a caminho (independente de origem) —
-          // evita duplicar esforço com farms já enviados manualmente ou no ciclo anterior
-          if (outgoingAttacks.has(target.coords)) continue;
+          const sentThisCycle = sentCount.get(target.villageId) || 0;
+          // checa slots: quantos farms ainda cabem (já indo + já enviados < max)
+          if (slotsAvailable(target, sentThisCycle) <= 0) continue;
           // pula bárbaras com defesa detectada (muralha ≥1 ou tropa)
           const th = getThreat(target.villageId);
           if (isThreatActive(th)) continue;
           // modo seguro: só farma com threat seguro recente; sem isso, pula
           if (f.safeMode && !isThreatSafe(th)) continue;
-          const c = sentCount.get(target.villageId) || 0;
-          if (c >= f.maxPerBarbarian) continue;
 
           let tplToUse = tplA;
           let label = 'A';
           if (target.hadLosses) {
             // perdas → registra na lista de wall-break, não dispara
-            // (envio de spy puro requer troca temporária de template, fica pra melhoria futura)
             label = 'spy';
             if (!wallBreakSet.has(target.coords)) {
               state.farmer.needsWallBreak.push({ x: target.x, y: target.y, lastAttempt: Date.now() });
@@ -5889,6 +5941,19 @@
             label = 'B';
           }
 
+          // simulação de tropa: se origem não tem o template,
+          // pula sem chamar API. Se for o template B e ela tem A, usa A
+          // (downgrade pragmático — saque cheio mas sem tropas pra B).
+          if (!hasTroopsFor(origin.id, tplToUse)) {
+            if (tplToUse === tplB && hasTroopsFor(origin.id, tplA)) {
+              tplToUse = tplA;
+              label = 'A↓';     // marca downgrade de B pra A
+            } else {
+              // sem tropa nem pra A → próxima origem
+              break;
+            }
+          }
+
           try {
             await Game.dispatchFarm({
               sourceVillageId: origin.id,
@@ -5896,7 +5961,8 @@
               templateId: tplToUse.id,
               csrf,
             });
-            sentCount.set(target.villageId, c + 1);
+            subtractTroopsFor(origin.id, tplToUse);
+            sentCount.set(target.villageId, sentThisCycle + 1);
             dispatched++;
             processed++;
             updateFarmerProgress(processed, planned);
@@ -5904,10 +5970,11 @@
           } catch (e) {
             failed++;
             const msg = e.message || String(e);
-            // erros comuns que viram skip silencioso (continua próxima)
+            // tropa insuficiente que escapou da simulação: zera tropas e abandona origem
             if (/insuficiente|tropas|unit|not enough/i.test(msg)) {
+              originUnits.set(origin.id, {});
               pushFarmerLog(`sem tropas em ${origin.name}, próxima origem.`);
-              break;     // sai do loop interno, vai pra próxima origem
+              break;
             }
             pushFarmerLog(`falha: ${origin.name} → ${target.coords}: ${msg}`);
           }
@@ -6088,7 +6155,7 @@
         const coords = `${v.x}|${v.y}`;
         for (const origin of origins) {
           if (distanceFields(origin.x, origin.y, v.x, v.y) <= f.searchRadius) {
-            if (outgoing.has(coords)) {
+            if ((outgoing.get(coords) || 0) > 0) {
               skippedOutgoing++;
               break;
             }
@@ -6103,7 +6170,7 @@
       // com confiança no próximo ciclo.
       let knownNeedingScout = 0;
       for (const b of known) {
-        if (outgoing.has(b.coords)) continue;
+        if ((outgoing.get(b.coords) || 0) > 0) continue;
         const th = getThreat(b.villageId);
         if (isThreatActive(th) || isThreatSafe(th)) continue;
         if (candidates.has(b.villageId)) continue;

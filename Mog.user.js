@@ -5848,6 +5848,39 @@
         pushFarmerLog('Falha ao ler bárbaras do assistente: ' + e.message);
         return;
       }
+
+      // 3.1. inclui na list bárbaras que SUMIRAM do AS mas têm ataque indo. O TW
+      // remove do #plunder_list enquanto há comando em curso/retornando, então
+      // o loop nunca as enxergaria. Resolvemos buscando dados no mapa global.
+      const knownCoords = new Set(list.map(t => t.coords));
+      const ghostCoords = [...outgoingAttacks.keys()].filter(c => !knownCoords.has(c));
+      if (ghostCoords.length > 0) {
+        try {
+          const world = await Game.fetchAllWorldVillages();
+          // Map<"x|y", {id, x, y}>
+          const worldByCoord = new Map(world.map(v => [`${v.x}|${v.y}`, v]));
+          let added = 0;
+          for (const coord of ghostCoords) {
+            const v = worldByCoord.get(coord);
+            if (!v || v.owner !== 0) continue;     // só bárbara
+            // entrada minimalista — sem reportId/fullLoot/hadLosses (não temos AS)
+            list.push({
+              villageId: v.id,
+              x: v.x, y: v.y,
+              coords: coord,
+              fullLoot: false,
+              hadLosses: false,
+              reportId: null,
+              lastAttackText: '(sob ataque)',
+            });
+            added++;
+          }
+          if (added > 0) pushFarmerLog(`+${added} bárbara(s) sob ataque adicionadas (sumiram do AS).`);
+        } catch (e) {
+          pushFarmerLog('Aviso: falha ao buscar bárbaras-fantasma no mapa: ' + e.message);
+        }
+      }
+
       if (!list.length) {
         pushFarmerLog('Nenhuma bárbara registrada no assistente.');
         return;

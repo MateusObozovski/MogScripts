@@ -1089,11 +1089,12 @@
     return result;
   }
 
-  // Retorna Map<"x|y", count> de ataques saindo agora.
-  // Por que Map em vez de Set: precisamos saber QUANTOS ataques estão indo
-  // pra cada coord, não só "tem ou não tem". Bárbaras somem do #plunder_list
-  // enquanto há comando indo, então essa é nossa fonte canônica de "quantos
-  // farms já mandei pra X|Y" — sobrevive ao desaparecimento da bárbara da AS.
+  // Retorna Map<"x|y", { count, arrivals: [timestamp_ms, ...] }> de ataques saindo agora.
+  // Por que armazenar arrivals: pra implementar janela temporal entre farms na mesma
+  // bárbara (não mandar 2 que chegam quase juntos). Bárbaras somem do #plunder_list
+  // enquanto há comando indo, então overview_villages?mode=command é a fonte canônica.
+  // Estrutura da linha: td[0]=label com coords, td[1]="hoje às HH:MM:SS:mmm" (chegada),
+  // td[2]=tempo restante. Tipo via [data-command-type="attack"] em <span class="command_hover_details">.
   function parseOutgoingAttacks(html) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const out = new Map();
@@ -1105,9 +1106,47 @@
       const m = label.match(/\((\d{1,3})\|(\d{1,3})\)/);
       if (!m) return;
       const coord = `${m[1]}|${m[2]}`;
-      out.set(coord, (out.get(coord) || 0) + 1);
+      const tds = tr.querySelectorAll('td');
+      const arrivalText = tds[1]?.textContent.trim() || '';
+      const arrivalAt = parseTwArrivalText(arrivalText);   // pode ser null se não conseguir
+      const entry = out.get(coord) || { count: 0, arrivals: [] };
+      entry.count += 1;
+      if (arrivalAt) entry.arrivals.push(arrivalAt);
+      out.set(coord, entry);
     });
     return out;
+  }
+
+  // Parsea texto de chegada do TW para timestamp local (ms).
+  // Formatos observados (pt-BR br142):
+  //   "hoje às HH:MM:SS:mmm"
+  //   "amanhã às HH:MM:SS:mmm"
+  //   "DD.MM. às HH:MM:SS:mmm"      (ano implícito = atual)
+  //   "DD.MM.YYYY às HH:MM:SS:mmm"
+  // Retorna null se não conseguir parsear.
+  function parseTwArrivalText(s) {
+    if (!s) return null;
+    const timeMatch = s.match(/(\d{1,2}):(\d{2}):(\d{2})(?::(\d{1,3}))?/);
+    if (!timeMatch) return null;
+    const [, hh, mm, ss, ms] = timeMatch;
+    const now = new Date();
+    const d = new Date(now);
+    if (/hoje/i.test(s)) {
+      // mantém data atual
+    } else if (/amanh[aã]/i.test(s)) {
+      d.setDate(d.getDate() + 1);
+    } else {
+      // tenta DD.MM ou DD.MM.YYYY
+      const dm = s.match(/(\d{1,2})\.(\d{1,2})\.?(\d{2,4})?/);
+      if (!dm) return null;
+      const day = parseInt(dm[1], 10);
+      const month = parseInt(dm[2], 10) - 1;
+      const yearTok = dm[3];
+      const year = yearTok ? (yearTok.length === 2 ? 2000 + parseInt(yearTok, 10) : parseInt(yearTok, 10)) : now.getFullYear();
+      d.setFullYear(year, month, day);
+    }
+    d.setHours(parseInt(hh, 10), parseInt(mm, 10), parseInt(ss, 10), ms ? parseInt(ms, 10) : 0);
+    return d.getTime();
   }
 
   // Parsea #plunder_list (tabela de bárbaras conhecidas no Assistente de Saque).
@@ -5336,6 +5375,11 @@
             <label>Máx por bárbara</label>
             <input class="mog-input" type="number" min="1" id="mog-farm-maxbarb" value="${f.maxPerBarbarian}">
           </div>
+          <div class="mog-farm-config-row" title="Janela mínima entre chegadas de farms na mesma bárbara. Evita 2 farms chegando muito perto. 0 = desativado.">
+            <label>Janela entre chegadas</label>
+            <input class="mog-input" type="number" min="0" id="mog-farm-arrival-window" value="${f.arrivalWindowMin}">
+            <span class="mog-farm-suffix">min</span>
+          </div>
           <div class="mog-farm-config-row">
             <label>Raio busca</label>
             <input class="mog-input" type="number" min="1" max="50" id="mog-farm-radius" value="${f.searchRadius}">
@@ -5497,6 +5541,14 @@
       state.farmer.maxPerBarbarian = isNaN(v) || v < 1 ? 1 : v;
       persist();
     });
+    const awInp = root.querySelector('#mog-farm-arrival-window');
+    if (awInp) {
+      awInp.addEventListener('input', e => {
+        const v = parseInt(e.target.value, 10);
+        state.farmer.arrivalWindowMin = isNaN(v) || v < 0 ? 0 : v;
+        persist();
+      });
+    }
     const safeBtn = root.querySelector('#mog-farm-safemode');
     if (safeBtn) {
       safeBtn.addEventListener('click', () => {
@@ -5828,6 +5880,31 @@
         }
       };
 
+      // 3a2. garante worldConfig fresco (velocidades de unidade) pra calcular ETA
+      // dos farms que vamos enviar e comparar com chegadas existentes.
+      try {
+        await ensureWorldConfig();
+      } catch (e) {
+        pushFarmerLog('Aviso: falha ao ler config do mundo: ' + e.message);
+      }
+      // helper: ETA estimada (timestamp ms) de um farm origin→target com determinado template
+      const etaFor = (origin, target, tpl) => {
+        const speedMpf = slowestSpeed(tpl.units || {});
+        if (!speedMpf) return null;     // sem unidade no template ou config faltando
+        const travel = travelTimeMs({ x: origin.x, y: origin.y }, { x: target.x, y: target.y }, speedMpf);
+        return Date.now() + travel;
+      };
+      // helper: viola janela temporal? compara ETA do novo farm com chegadas existentes
+      const arrivalWindowMs = Math.max(0, (f.arrivalWindowMin || 0)) * 60 * 1000;
+      const violatesArrivalWindow = (target, eta) => {
+        if (!eta || arrivalWindowMs === 0) return false;
+        const existing = arrivalsAt(target.coords);
+        for (const t of existing) {
+          if (Math.abs(t - eta) < arrivalWindowMs) return true;
+        }
+        return false;
+      };
+
       // 3b. atualiza relatórios de espionagem (defesa/muralha) — cache curto evita re-fetch
       try {
         await refreshThreats(list);
@@ -5835,12 +5912,10 @@
         pushFarmerLog('Aviso: falha ao atualizar relatórios: ' + e.message);
       }
 
-      // helper: quantos farms já estão indo pra essa coord (vivem em
-      // overview_villages?screen=place&mode=command, fonte canônica que
-      // sobrevive ao desaparecimento da bárbara do AS).
-      const attacksGoingTo = (coords) => outgoingAttacks.get(coords) || 0;
-      // helper: quantos farms ainda cabem nessa bárbara antes de atingir maxPerBarbarian
-      // somando o que já está indo + o que já enviamos neste ciclo
+      // helpers consolidados sobre outgoingAttacks. Estrutura: Map<coord, {count, arrivals: ms[]}>
+      const attacksGoingTo = (coords) => outgoingAttacks.get(coords)?.count || 0;
+      const arrivalsAt = (coords) => outgoingAttacks.get(coords)?.arrivals || [];
+      // quantos farms ainda cabem nessa bárbara antes de atingir maxPerBarbarian
       const slotsAvailable = (target, sentThisCycle = 0) => {
         const going = attacksGoingTo(target.coords);
         return Math.max(0, f.maxPerBarbarian - going - sentThisCycle);
@@ -5954,6 +6029,11 @@
             }
           }
 
+          // janela temporal: estima ETA do farm e bloqueia se chegar muito perto
+          // de outra chegada. Evita 2 farms na mesma bárbara em janela < arrivalWindowMin.
+          const eta = etaFor(origin, target, tplToUse);
+          if (violatesArrivalWindow(target, eta)) continue;
+
           try {
             await Game.dispatchFarm({
               sourceVillageId: origin.id,
@@ -5963,6 +6043,13 @@
             });
             subtractTroopsFor(origin.id, tplToUse);
             sentCount.set(target.villageId, sentThisCycle + 1);
+            // registra ETA no map de chegadas pra próximas iterações respeitarem
+            if (eta) {
+              const entry = outgoingAttacks.get(target.coords) || { count: 0, arrivals: [] };
+              entry.count += 1;
+              entry.arrivals.push(eta);
+              outgoingAttacks.set(target.coords, entry);
+            }
             dispatched++;
             processed++;
             updateFarmerProgress(processed, planned);

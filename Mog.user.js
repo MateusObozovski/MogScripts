@@ -5519,13 +5519,6 @@
         findNewBarbarians();
       });
     }
-    const testCaptchaBtn = root.querySelector('#mog-farm-test-captcha');
-    if (testCaptchaBtn) {
-      testCaptchaBtn.addEventListener('click', () => {
-        if (!confirm('Teste do captcha guard. Vai parar tudo, mostrar banner vermelho e deslogar do TW em 1.5s. Continuar?')) return;
-        tripCaptcha('teste manual via botão DEV');
-      });
-    }
   }
 
   function bindFarmerTemplates() {

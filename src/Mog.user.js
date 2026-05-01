@@ -203,6 +203,10 @@
       cycleMin: 10,
       maxPerBarbarian: 1,
       searchRadius: 10,
+      // Modo seguro: só farma bárbaras com último relatório limpo dentro do TTL.
+      // Quando ON, ciclo espiona bárbaras sem threats ativo antes de farmar (+1 ciclo de espera).
+      // Default ON pra evitar perdas com bárbaras nunca espionadas.
+      safeMode: true,
       needsWallBreak: [],
       // threats: ameaças detectadas via relatório de espionagem.
       // Cada entry: { villageId, x, y, coords, wall, units: {spear, sword, ...}, away: {...}, scoutedAt, reportId }
@@ -300,6 +304,7 @@
     if (Number.isFinite(parsed.cycleMin)) base.cycleMin = parsed.cycleMin;
     if (Number.isFinite(parsed.maxPerBarbarian)) base.maxPerBarbarian = parsed.maxPerBarbarian;
     if (Number.isFinite(parsed.searchRadius)) base.searchRadius = parsed.searchRadius;
+    if (typeof parsed.safeMode === 'boolean') base.safeMode = parsed.safeMode;
     if (Array.isArray(parsed.needsWallBreak)) base.needsWallBreak = parsed.needsWallBreak;
     if (Array.isArray(parsed.threats)) base.threats = parsed.threats;
     if (Array.isArray(parsed.log)) base.log = parsed.log;
@@ -2916,6 +2921,16 @@
       font-size: 10.5px; color: #777; letter-spacing: 0.1px;
       flex: 0 0 auto;
     }
+    .mog-farm-safemode {
+      grid-column: 1 / -1;
+      padding: 4px 0;
+      border-top: 1px solid #232424;
+      margin-top: 2px;
+    }
+    .mog-farm-safemode .mog-toggle {
+      padding: 4px 12px;
+      font-size: 10.5px;
+    }
 
     .mog-farm-tpl {
       background: #141515;
@@ -5049,6 +5064,10 @@
             <input class="mog-input" type="number" min="1" max="50" id="mog-farm-radius" value="${f.searchRadius}">
             <span class="mog-farm-suffix">campos</span>
           </div>
+          <div class="mog-farm-config-row mog-farm-safemode" title="Quando ativo, só farma bárbaras com último relatório de espionagem dentro de 24h confirmando que estão limpas (sem muralha, sem tropa). Bárbaras sem relatório são espionadas antes e farmadas no próximo ciclo.">
+            <label>Modo seguro</label>
+            <button class="mog-toggle ${f.safeMode ? 'mog-on' : ''}" id="mog-farm-safemode" style="margin-left: auto;">${f.safeMode ? 'Ativo' : 'Desligado'}</button>
+          </div>
         </div>
       </div>
 
@@ -5201,6 +5220,18 @@
       state.farmer.maxPerBarbarian = isNaN(v) || v < 1 ? 1 : v;
       persist();
     });
+    const safeBtn = root.querySelector('#mog-farm-safemode');
+    if (safeBtn) {
+      safeBtn.addEventListener('click', () => {
+        state.farmer.safeMode = !state.farmer.safeMode;
+        persist();
+        safeBtn.classList.toggle('mog-on', state.farmer.safeMode);
+        safeBtn.textContent = state.farmer.safeMode ? 'Ativo' : 'Desligado';
+        pushFarmerLog(state.farmer.safeMode
+          ? 'Modo seguro ativado: só farma bárbaras com relatório limpo recente.'
+          : 'Modo seguro desligado: farma todas (risco de perdas).');
+      });
+    }
     const runBtn = root.querySelector('#mog-farm-run-now');
     if (runBtn) {
       runBtn.addEventListener('click', () => {
@@ -5354,6 +5385,14 @@
     return (t.wall >= 1) || (t.totalUnits > 0) || (t.totalAway > 0);
   }
 
+  // Bárbara é "segura pra farmar" SE tem threat dentro do TTL com tudo zerado.
+  // Sem threat ou threat vencido → NÃO é segura (precisa reespionar antes).
+  function isThreatSafe(t) {
+    if (!t) return false;
+    if (Date.now() - (t.scoutedAt || 0) > THREAT_TTL_MS) return false;
+    return (t.wall || 0) === 0 && (t.totalUnits || 0) === 0 && (t.totalAway || 0) === 0;
+  }
+
   function upsertThreat(entry) {
     const i = state.farmer.threats.findIndex(t => t.villageId === entry.villageId);
     if (i >= 0) state.farmer.threats[i] = entry;
@@ -5486,16 +5525,47 @@
         pushFarmerLog('Aviso: falha ao atualizar relatórios: ' + e.message);
       }
 
-      // 4. pré-calcula upper bound de envios. Exclui bárbaras com perdas, ataque
-      // a caminho ou defesa detectada (muralha ≥1 ou tropa).
+      // 3c. modo seguro: bárbaras sem threat seguro (sem espionagem ou vencida)
+      // são espionadas ANTES do dispatch. Próximo ciclo farma com confiança.
+      // Excluí: bárbaras com defesa detectada, com ataque a caminho, ou já com
+      // threat seguro recente.
+      if (f.safeMode) {
+        const needScout = list.filter(t => {
+          if (t.hadLosses) return false;
+          if (outgoingAttacks.has(t.coords)) return false;
+          const th = getThreat(t.villageId);
+          if (isThreatActive(th)) return false;     // já sabemos que tem defesa
+          if (isThreatSafe(th)) return false;        // já sabemos que está limpa
+          return true;                                // sem dados → espionar
+        });
+        if (needScout.length > 0) {
+          pushFarmerLog(`Modo seguro: espionando ${needScout.length} bárbara(s) sem dados.`);
+          try {
+            await scoutBarbarians(needScout, { logPrefix: 'espia' });
+          } catch (e) {
+            pushFarmerLog('Falha ao espionar: ' + e.message);
+          }
+        }
+      }
+
+      // 4. pré-calcula upper bound de envios. Exclui:
+      //   - bárbaras com perdas
+      //   - ataque a caminho
+      //   - defesa detectada (wall ou tropa)
+      //   - safeMode + sem threat seguro (sem espionagem ou vencida)
       const eligible = list.filter(t => {
         if (t.hadLosses) return false;
         if (outgoingAttacks.has(t.coords)) return false;
-        if (isThreatActive(getThreat(t.villageId))) return false;
+        const th = getThreat(t.villageId);
+        if (isThreatActive(th)) return false;
+        if (f.safeMode && !isThreatSafe(th)) return false;
         return true;
       });
       const skippedAlreadyAttacking = list.filter(t => !t.hadLosses && outgoingAttacks.has(t.coords)).length;
       const skippedDefended = list.filter(t => !t.hadLosses && isThreatActive(getThreat(t.villageId))).length;
+      const skippedNoScout = f.safeMode
+        ? list.filter(t => !t.hadLosses && !outgoingAttacks.has(t.coords) && !isThreatActive(getThreat(t.villageId)) && !isThreatSafe(getThreat(t.villageId))).length
+        : 0;
       const planned = Math.min(
         eligible.length * f.maxPerBarbarian,
         eligible.length * origins.length
@@ -5503,6 +5573,7 @@
       const extras = [];
       if (skippedAlreadyAttacking > 0) extras.push(`${skippedAlreadyAttacking} c/ ataque a caminho`);
       if (skippedDefended > 0) extras.push(`${skippedDefended} c/ defesa detectada`);
+      if (skippedNoScout > 0) extras.push(`${skippedNoScout} aguardando relatório`);
       const extra = extras.length ? `, ${extras.join(', ')}` : '';
       pushFarmerLog(`${origins.length} origem(ns), ${list.length} bárbara(s)${extra}, ~${planned} envio(s) planejado(s).`);
       updateFarmerProgress(0, planned);
@@ -5522,7 +5593,10 @@
           // evita duplicar esforço com farms já enviados manualmente ou no ciclo anterior
           if (outgoingAttacks.has(target.coords)) continue;
           // pula bárbaras com defesa detectada (muralha ≥1 ou tropa)
-          if (isThreatActive(getThreat(target.villageId))) continue;
+          const th = getThreat(target.villageId);
+          if (isThreatActive(th)) continue;
+          // modo seguro: só farma com threat seguro recente; sem isso, pula
+          if (f.safeMode && !isThreatSafe(th)) continue;
           const c = sentCount.get(target.villageId) || 0;
           if (c >= f.maxPerBarbarian) continue;
 
@@ -5606,6 +5680,97 @@
   // filtra as que já estão no assistente, e dispara 1 espião pra cada uma —
   // assim elas viram entradas conhecidas no Assistente de Saque pra futuros ciclos.
   // Truque: troca temporariamente o modelo A pra "1 espião", dispara, restaura A original.
+  // Espiona uma lista pré-determinada de bárbaras. Usa a mesma mecânica de
+  // troca temporária de template A pra spy=1 que `findNewBarbarians`.
+  // params: targets = [{ villageId, x, y, coords, name? }, ...]
+  // Retorna { dispatched, failed }. Restaura modelo A no finally.
+  // Caller é responsável por gerenciar `state.farmer.busy`.
+  async function scoutBarbarians(targets, { logPrefix = 'espia' } = {}) {
+    if (targets.length === 0) return { dispatched: 0, failed: 0 };
+    const f = state.farmer;
+    let originalA = null, templatesSnapshot = null, csrf = null;
+    let dispatched = 0, failed = 0;
+
+    try {
+      const tplData = await Game.fetchFarmTemplates();
+      if (!tplData.templates.length) throw new Error('sem modelos');
+      templatesSnapshot = tplData.templates;
+      csrf = tplData.csrf;
+      originalA = { ...templatesSnapshot[0], units: { ...templatesSnapshot[0].units } };
+
+      const origins = await Game.fetchGroupVillages(f.groupId);
+      const units = await Game.fetchAllUnits(f.groupId);
+      const originsWithSpy = origins.filter(o => (units.get(String(o.id))?.spy || 0) > 0);
+      if (originsWithSpy.length === 0) throw new Error('nenhuma aldeia tem espião');
+      const totalSpies = originsWithSpy.reduce((acc, o) => acc + (units.get(String(o.id))?.spy || 0), 0);
+
+      const spyTpl = {
+        id: originalA.id,
+        units: Object.fromEntries(FARMER_UNIT_KEYS.map(k => [k, k === 'spy' ? 1 : 0])),
+        catapultTarget: originalA.catapultTarget,
+      };
+      spyTpl.units.catapult = 0;
+      await Game.updateFarmTemplates({ templates: [spyTpl, templatesSnapshot[1]].filter(Boolean), csrf });
+      pushFarmerLog('Modelo A → 1 espião (temporário).');
+      const refreshed = await Game.fetchFarmTemplates();
+      csrf = refreshed.csrf;
+
+      const limit = Math.min(targets.length, totalSpies);
+      if (limit < targets.length) {
+        pushFarmerLog(`Limitando a ${limit} ${logPrefix}(s) — só ${totalSpies} espião(ões) disponível(eis).`);
+      }
+
+      let cursor = 0;
+      const exhausted = new Set();
+      for (let i = 0; i < limit; i++) {
+        const t = targets[i];
+        if (exhausted.size >= originsWithSpy.length) break;
+        let sent = false;
+        for (let attempt = 0; attempt < originsWithSpy.length; attempt++) {
+          const origin = originsWithSpy[(cursor + attempt) % originsWithSpy.length];
+          if (exhausted.has(origin.id)) continue;
+          try {
+            await Game.dispatchFarm({
+              sourceVillageId: origin.id,
+              targetVillageId: t.villageId,
+              templateId: originalA.id,
+              csrf,
+            });
+            dispatched++;
+            cursor = (cursor + attempt + 1) % originsWithSpy.length;
+            sent = true;
+            pushFarmerLog(`[${dispatched}/${limit}] ${logPrefix}: ${origin.name} → ${t.coords}`);
+            break;
+          } catch (e) {
+            const msg = e.message || String(e);
+            if (/insuficiente|tropas|unit|not enough/i.test(msg)) {
+              exhausted.add(origin.id);
+              continue;
+            }
+            failed++;
+            pushFarmerLog(`falha ${logPrefix} ${t.coords}: ${msg}`);
+            break;
+          }
+        }
+        if (!sent && exhausted.size < originsWithSpy.length) failed++;
+        await sleep(randomInRange(f.timing.minMs, f.timing.maxMs));
+      }
+    } finally {
+      if (originalA && csrf && templatesSnapshot) {
+        try {
+          await Game.updateFarmTemplates({
+            templates: [originalA, templatesSnapshot[1]].filter(Boolean),
+            csrf,
+          });
+          pushFarmerLog('Modelo A restaurado.');
+        } catch (e) {
+          pushFarmerLog('AVISO: falha ao restaurar modelo A: ' + e.message);
+        }
+      }
+    }
+    return { dispatched, failed };
+  }
+
   async function findNewBarbarians() {
     const f = state.farmer;
     if (f.busy) {
@@ -5617,44 +5782,25 @@
     refreshFarmerHeader();
     pushFarmerLog(`Buscando bárbaras em raio ${f.searchRadius}...`);
 
-    let originalA = null;
-    let templatesSnapshot = null;
-    let csrf = null;
-
     try {
-      // 1. carrega templates (precisa A pra trocar e B pra preservar no save)
-      const tplData = await Game.fetchFarmTemplates();
-      if (!tplData.templates.length) throw new Error('nenhum modelo configurado no Assistente');
-      templatesSnapshot = tplData.templates;
-      csrf = tplData.csrf;
-      originalA = { ...templatesSnapshot[0], units: { ...templatesSnapshot[0].units } };
-
-      // 2. lê origens
       const origins = await Game.fetchGroupVillages(f.groupId);
       if (!origins.length) throw new Error('grupo sem aldeias');
 
-      // 3. valida que ao menos 1 origem tem espião — sem isso a busca não tem o que fazer
-      let unitsByVillage;
-      try {
-        unitsByVillage = await Game.fetchAllUnits(f.groupId);
-      } catch (e) {
-        throw new Error('falha ao ler tropas: ' + e.message);
-      }
-      const originsWithSpy = origins.filter(o => (unitsByVillage.get(String(o.id))?.spy || 0) > 0);
-      if (originsWithSpy.length === 0) {
-        throw new Error('nenhuma aldeia do grupo tem espião disponível');
-      }
-      const totalSpies = originsWithSpy.reduce((acc, o) => acc + (unitsByVillage.get(String(o.id))?.spy || 0), 0);
-      pushFarmerLog(`${originsWithSpy.length}/${origins.length} aldeia(s) com espião (${totalSpies} no total).`);
-
-      // 4. lê bárbaras já conhecidas no Assistente + ataques saindo agora
+      // lê bárbaras conhecidas + ataques saindo
       const [known, outgoing] = await Promise.all([
         Game.fetchFarmAssistantList(origins[0].id),
-        Game.fetchOutgoingAttacks().catch(e => { pushFarmerLog('Aviso: falha ao ler comandos saindo (seguindo sem filtro): ' + e.message); return new Set(); }),
+        Game.fetchOutgoingAttacks().catch(e => { pushFarmerLog('Aviso: falha ao ler comandos saindo: ' + e.message); return new Set(); }),
       ]);
       const knownIds = new Set(known.map(b => b.villageId));
 
-      // 5. carrega mapa do mundo (cacheado após 1ª chamada)
+      // garante que threats das conhecidas estão atualizadas (cache evita re-fetch)
+      try {
+        await refreshThreats(known);
+      } catch (e) {
+        pushFarmerLog('Aviso: falha ao atualizar relatórios: ' + e.message);
+      }
+
+      // mapa do mundo (cacheado)
       let world;
       try {
         world = await Game.fetchAllWorldVillages();
@@ -5662,7 +5808,7 @@
         throw new Error('falha ao carregar mapa: ' + e.message);
       }
 
-      // 6. coleta candidatas: bárbaras (owner=0) dentro do raio, não conhecidas e sem ataque indo
+      // candidatas tipo 1: bárbaras NOVAS no raio, não conhecidas, sem ataque indo
       const candidates = new Map();
       let skippedOutgoing = 0;
       for (const v of world) {
@@ -5675,102 +5821,45 @@
               skippedOutgoing++;
               break;
             }
-            candidates.set(v.id, v);
+            candidates.set(v.id, { villageId: v.id, x: v.x, y: v.y, coords, name: v.name });
             break;
           }
         }
       }
+
+      // candidatas tipo 2: bárbaras CONHECIDAS sem threat ativo nem seguro
+      // (sem espionagem, ou relatório vencido). Habilita o farmer a farmá-las
+      // com confiança no próximo ciclo.
+      let knownNeedingScout = 0;
+      for (const b of known) {
+        if (outgoing.has(b.coords)) continue;
+        const th = getThreat(b.villageId);
+        if (isThreatActive(th) || isThreatSafe(th)) continue;
+        if (candidates.has(b.villageId)) continue;
+        candidates.set(b.villageId, { villageId: b.villageId, x: b.x, y: b.y, coords: b.coords });
+        knownNeedingScout++;
+      }
+
       const candList = [...candidates.values()];
-      const extra = skippedOutgoing > 0 ? ` (+${skippedOutgoing} pulada(s) com ataque já a caminho)` : '';
-      pushFarmerLog(`${candList.length} bárbara(s) nova(s) dentro do raio ${f.searchRadius}${extra}.`);
+      const parts = [];
+      if (skippedOutgoing > 0) parts.push(`${skippedOutgoing} pulada(s) c/ ataque a caminho`);
+      if (knownNeedingScout > 0) parts.push(`${knownNeedingScout} conhecida(s) sem relatório`);
+      const extra = parts.length ? ` (${parts.join(', ')})` : '';
+      pushFarmerLog(`${candList.length} bárbara(s) pra espionar${extra}.`);
       if (candList.length === 0) return;
 
-      // 6. troca modelo A pra "1 espião"
-      const spyTemplate = {
-        id: originalA.id,
-        units: Object.fromEntries(FARMER_UNIT_KEYS.map(k => [k, k === 'spy' ? 1 : 0])),
-        catapultTarget: originalA.catapultTarget,
-      };
-      // preserva catapult (não está em FARMER_UNIT_KEYS) zerada também
-      spyTemplate.units.catapult = 0;
-      await Game.updateFarmTemplates({
-        templates: [spyTemplate, templatesSnapshot[1]].filter(Boolean),
-        csrf,
-      });
-      pushFarmerLog('Modelo A trocado pra 1 espião.');
-      // o jogo pode rotacionar o csrf após edit — recarrega
-      const refreshed = await Game.fetchFarmTemplates();
-      csrf = refreshed.csrf;
-
-      // 7. dispara 1 espião pra cada candidata. Round-robin entre origins-com-espião,
-      // se uma origem retornar "sem tropas" tenta a próxima — espiões esgotados não
-      // bloqueiam o resto. Limita também ao total de espiões disponíveis pra evitar
-      // tentativas que sabidamente vão falhar.
-      const dispatchPool = [...originsWithSpy];
-      const targetCount = Math.min(candList.length, totalSpies);
-      if (targetCount < candList.length) {
-        pushFarmerLog(`Limitando a ${targetCount} envio(s) — só ${totalSpies} espião(ões) disponível(eis).`);
-      }
-      updateFarmerProgress(0, targetCount);
-      let dispatched = 0;
-      let cursor = 0;
-      const exhausted = new Set();
-      for (let i = 0; i < targetCount; i++) {
-        const cand = candList[i];
-        if (exhausted.size >= dispatchPool.length) {
-          pushFarmerLog('Todas as origens ficaram sem espião — interrompendo.');
-          break;
-        }
-        let sent = false;
-        for (let attempt = 0; attempt < dispatchPool.length; attempt++) {
-          const origin = dispatchPool[(cursor + attempt) % dispatchPool.length];
-          if (exhausted.has(origin.id)) continue;
-          try {
-            await Game.dispatchFarm({
-              sourceVillageId: origin.id,
-              targetVillageId: cand.id,
-              templateId: originalA.id,
-              csrf,
-            });
-            dispatched++;
-            cursor = (cursor + attempt + 1) % dispatchPool.length;
-            sent = true;
-            updateFarmerProgress(dispatched, targetCount);
-            pushFarmerLog(`[${dispatched}/${targetCount}] espia: ${origin.name} → ${cand.x}|${cand.y}`);
-            break;
-          } catch (e) {
-            const msg = e.message || String(e);
-            if (/insuficiente|tropas|unit|not enough/i.test(msg)) {
-              exhausted.add(origin.id);
-              continue;     // tenta próxima origem
-            }
-            // erro não-relacionado a tropas: pula essa candidata
-            pushFarmerLog(`falha espia ${cand.x}|${cand.y}: ${msg}`);
-            break;
-          }
-        }
-        if (!sent && exhausted.size < origins.length) {
-          pushFarmerLog(`pulou ${cand.x}|${cand.y}: nenhuma origem com espião disponível.`);
-        }
-        await sleep(randomInRange(f.timing.minMs, f.timing.maxMs));
-      }
-      pushFarmerLog(`Busca concluída: ${dispatched}/${targetCount} espia(s) enviada(s).`);
+      updateFarmerProgress(0, candList.length);
+      const result = await scoutBarbarians(candList, { logPrefix: 'espia' });
+      updateFarmerProgress(result.dispatched, candList.length);
+      pushFarmerLog(`Busca concluída: ${result.dispatched}/${candList.length} espia(s) enviada(s).`);
       setTimeout(() => updateFarmerProgress(0, 0), 5000);
+
+      // depois de espionar, atualiza threats das que acabaram de ser espionadas
+      // — mas só se conseguimos disparar. Pequeno delay pra relatório voltar
+      // não vale a pena aqui; usuário vai ver na próxima atualização.
     } catch (e) {
       pushFarmerLog('Falha na busca: ' + e.message);
     } finally {
-      // 8. restaura modelo A original
-      if (originalA && csrf && templatesSnapshot) {
-        try {
-          await Game.updateFarmTemplates({
-            templates: [originalA, templatesSnapshot[1]].filter(Boolean),
-            csrf,
-          });
-          pushFarmerLog('Modelo A restaurado.');
-        } catch (e) {
-          pushFarmerLog('AVISO: falha ao restaurar modelo A — verifique manualmente. ' + e.message);
-        }
-      }
       state.farmer.busy = false;
       persist();
       refreshFarmerHeader();
@@ -5962,53 +6051,11 @@
     persist();
     refreshFarmerHeader();
     pushFarmerLog(`Reespionando ${t.coords}...`);
-
-    let originalA = null, templatesSnapshot = null, csrf = null;
     try {
-      const tplData = await Game.fetchFarmTemplates();
-      if (!tplData.templates.length) throw new Error('sem modelos');
-      templatesSnapshot = tplData.templates;
-      csrf = tplData.csrf;
-      originalA = { ...templatesSnapshot[0], units: { ...templatesSnapshot[0].units } };
-
-      // origem com espião disponível
-      const origins = await Game.fetchGroupVillages(state.farmer.groupId);
-      const units = await Game.fetchAllUnits(state.farmer.groupId);
-      const withSpy = origins.find(o => (units.get(String(o.id))?.spy || 0) > 0);
-      if (!withSpy) throw new Error('nenhuma aldeia tem espião');
-
-      // troca A pra spy=1, dispara, restaura
-      const spyTpl = {
-        id: originalA.id,
-        units: Object.fromEntries(FARMER_UNIT_KEYS.map(k => [k, k === 'spy' ? 1 : 0])),
-        catapultTarget: originalA.catapultTarget,
-      };
-      spyTpl.units.catapult = 0;
-      await Game.updateFarmTemplates({ templates: [spyTpl, templatesSnapshot[1]].filter(Boolean), csrf });
-      const refreshed = await Game.fetchFarmTemplates();
-      csrf = refreshed.csrf;
-
-      await Game.dispatchFarm({
-        sourceVillageId: withSpy.id,
-        targetVillageId: villageId,
-        templateId: originalA.id,
-        csrf,
-      });
-      pushFarmerLog(`espia: ${withSpy.name} → ${t.coords}`);
+      await scoutBarbarians([{ villageId, x: t.x, y: t.y, coords: t.coords }], { logPrefix: 'rescout' });
     } catch (e) {
       pushFarmerLog(`falha rescout: ${e.message}`);
     } finally {
-      // restaura modelo A
-      if (originalA && csrf && templatesSnapshot) {
-        try {
-          await Game.updateFarmTemplates({
-            templates: [originalA, templatesSnapshot[1]].filter(Boolean),
-            csrf,
-          });
-        } catch (e) {
-          pushFarmerLog('AVISO: falha ao restaurar modelo A: ' + e.message);
-        }
-      }
       state.farmer.busy = false;
       persist();
       refreshFarmerHeader();

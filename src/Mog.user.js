@@ -1,6 +1,6 @@
 // ==UserScript==
-// @name         MILLENIUM
-// @version      0.7.2
+// @name         Millennium
+// @version      0.8.0
 // @description  Toolkit pessoal para Tribal Wars
 // @match        https://*.tribalwars.com.br/game.php?*
 // @grant        GM_addStyle
@@ -485,7 +485,7 @@
     return;
   }
 
-  const VERSION = '0.7.2';
+  const VERSION = '0.8.0';
   const STORAGE_KEY = 'mog_state_v1';
 
   const UNITS = [
@@ -615,6 +615,9 @@
       createdAt: overrides.createdAt || Date.now(),
       activatedAt: overrides.activatedAt || 0,
       finishedAt: overrides.finishedAt || 0,
+      // Padrão de chegada usado quando o usuário extrai coordenadas no passo 1.
+      // datetime: Unix ms com segundos truncados (.000); ms: 0..999.
+      defaultArrival: overrides.defaultArrival ?? { datetime: 0, ms: 0 },
       targets: overrides.targets || [],
       sourceGroups: overrides.sourceGroups || [],
       commands: overrides.commands || [],
@@ -670,10 +673,12 @@
     return {
       type: overrides.type || 'attack',                 // attack | support
       catapultTarget: overrides.catapultTarget || 'farm',
-      firstMs: overrides.firstMs ?? 200,
-      firstMsRandom: overrides.firstMsRandom ?? false,
-      firstMsMin: overrides.firstMsMin ?? 0,
-      firstMsMax: overrides.firstMsMax ?? 999,
+      // firstMs* mantidos no schema por compat, mas não são mais editáveis na UI nem
+      // adicionados ao executeAt. O ms da chegada agora vem de target.arrivalAt direto.
+      firstMs: 0,
+      firstMsRandom: false,
+      firstMsMin: 0,
+      firstMsMax: 0,
       waves,
     };
   }
@@ -823,6 +828,9 @@
   function migrateOperation(o) {
     return makeOperation({
       ...o,
+      defaultArrival: o.defaultArrival && typeof o.defaultArrival === 'object'
+        ? { datetime: o.defaultArrival.datetime || 0, ms: Math.max(0, Math.min(999, o.defaultArrival.ms || 0)) }
+        : { datetime: 0, ms: 0 },
       targets: Array.isArray(o.targets) ? o.targets : [],
       sourceGroups: Array.isArray(o.sourceGroups) ? o.sourceGroups.map(migrateSourceGroup) : [],
       commands: Array.isArray(o.commands) ? o.commands : [],
@@ -948,10 +956,10 @@
   // Aqui registramos só a limpeza state-aware: parar motores, zerar timers,
   // logar nos buffers do bot, e zerar a flag local na reativação.
   extraTripHandlers.push((reason) => {
+    // Captcha pausa motores SEM mexer nas flags `enabled` — preserva a intenção
+    // do usuário pra que `resumeFromCaptcha` saiba quem religar.
     state.captchaTrippedAt = Date.now();
-    state.enabled = false;
     if (state.farmer) {
-      state.farmer.enabled = false;
       state.farmer.busy = false;
       state.farmer.nextRunAt = 0;
     }
@@ -959,7 +967,6 @@
       state.recruiter.profiles.forEach(p => { p.nextRunAt = 0; });
     }
     if (state.builder) {
-      state.builder.enabled = false;
       state.builder.busy = false;
       if (Array.isArray(state.builder.profiles)) {
         state.builder.profiles.forEach(p => { p.nextRunAt = 0; p.running = null; });
@@ -1033,6 +1040,27 @@
       state.captchaTrippedAt = 0;
       try { persist(); } catch {}
     }
+    // Re-agenda timers de quem ainda está enabled. Funções podem ainda não
+    // estar definidas se reactivate dispara cedo no boot — try/catch tolerante.
+    try {
+      if (Array.isArray(state.recruiter?.profiles)) {
+        state.recruiter.profiles.forEach(p => {
+          if (p.enabled && typeof scheduleProfileNext === 'function') scheduleProfileNext(p);
+        });
+      }
+    } catch {}
+    try {
+      if (state.farmer?.enabled && typeof scheduleFarmerNext === 'function') {
+        scheduleFarmerNext();
+      }
+    } catch {}
+    try {
+      if (state.builder?.enabled && Array.isArray(state.builder.profiles) && typeof scheduleBuilderProfileNext === 'function') {
+        state.builder.profiles.forEach(p => {
+          if (p.enabled) scheduleBuilderProfileNext(p);
+        });
+      }
+    } catch {}
   });
 
   // Compat: se este storage tem flag local persistida (de versão antiga) mas o
@@ -2149,7 +2177,7 @@
   }
 
   async function runProfileCycle(profile) {
-    if (!state.enabled || !profile.enabled) return;
+    if (!profile.enabled || state.captchaTrippedAt > 0) return;
 
     pushLog(`[${profile.name}] ciclo iniciado.`);
     let villages;
@@ -2170,7 +2198,7 @@
     let touched = 0;
     for (let i = 0; i < villages.length; i++) {
       const v = villages[i];
-      if (!state.enabled || !profile.enabled) break;
+      if (!profile.enabled || state.captchaTrippedAt > 0) break;
       try {
         const td = await Game.fetchTrainData(v.id);
         const recruit = computeRecruitForVillage(profile, td);
@@ -2229,7 +2257,7 @@
 
   function scheduleProfileNext(profile) {
     clearTimeout(profileTimers.get(profile.id));
-    if (!state.enabled || !profile.enabled) {
+    if (!profile.enabled || state.captchaTrippedAt > 0) {
       profile.nextRunAt = 0;
       return;
     }
@@ -2239,13 +2267,13 @@
     const t = setTimeout(async () => {
       const fresh = state.recruiter.profiles.find(p => p.id === profile.id);
       if (!fresh) return;
-      if (state.enabled && fresh.enabled) {
+      if (fresh.enabled && state.captchaTrippedAt === 0) {
         // while em vez de if: se outro profile pega o lock entre o nosso await
         // e a leitura seguinte, esperamos esse novo também antes de prosseguir.
         while (recruiterCycleInFlight) {
           try { await recruiterCycleInFlight; } catch (_) {}
         }
-        if (state.enabled && fresh.enabled) {
+        if (fresh.enabled && state.captchaTrippedAt === 0) {
           recruiterCycleInFlight = (async () => {
             try { await runProfileCycle(fresh); }
             finally { recruiterCycleInFlight = null; }
@@ -2261,7 +2289,7 @@
   function startProfile(profile) {
     profile.enabled = true;
     persist();
-    if (state.enabled) scheduleProfileNext(profile);
+    scheduleProfileNext(profile);
     pushLog(`[${profile.name}] ativado.`);
   }
 
@@ -2274,40 +2302,25 @@
     pushLog(`[${profile.name}] desativado.`);
   }
 
-  function startGlobal() {
-    // reativar limpa flag de captcha — usuário voltou a logar e quer rodar de novo.
-    // Também zera a flag global cross-tab pra todas as abas saírem do modo trippado.
-    // Entra em carência pra evitar re-trip imediato se o hCaptcha residual ainda
-    // estiver no DOM da tela.
+  // Reativa o bot após captcha: limpa flag local + global, dispara broadcast
+  // cross-tab, remove banner e entra em carência. Os reactivateHandlers se
+  // encarregam de religar timers dos módulos que continuam `enabled`.
+  function resumeFromCaptcha() {
     const wasTripped = state.captchaTrippedAt > 0 || readGlobalTrip();
-    if (wasTripped) {
-      state.captchaTrippedAt = 0;
-      clearGlobalTrip();
-      if (captchaChannel) {
-        try { captchaChannel.postMessage({ type: 'REACTIVATE', ts: Date.now(), sourceTab: TAB_ID }); } catch {}
-      }
-      const banner = document.getElementById('mog-captcha-banner');
-      if (banner) banner.remove();
-      enterGracePeriod();
-      pushLog('Flag de captcha limpa — bot reativado (carência de 60s).');
-    }
-    state.enabled = true;
-    persist();
-    state.recruiter.profiles.forEach(p => {
-      if (p.enabled) scheduleProfileNext(p);
-    });
-    pushLog('Bot iniciado.');
-  }
+    if (!wasTripped) return;
 
-  function stopGlobal() {
-    state.enabled = false;
-    state.recruiter.profiles.forEach(p => {
-      p.nextRunAt = 0;
-      clearTimeout(profileTimers.get(p.id));
-    });
-    profileTimers.clear();
+    state.captchaTrippedAt = 0;
+    clearGlobalTrip();
+    if (captchaChannel) {
+      try { captchaChannel.postMessage({ type: 'REACTIVATE', ts: Date.now(), sourceTab: TAB_ID }); } catch {}
+    }
+    const banner = document.getElementById('mog-captcha-banner');
+    if (banner) banner.remove();
     persist();
-    pushLog('Bot pausado.');
+    enterGracePeriod();
+    pushLog('Captcha limpo — motores ativos retomam ciclos (carência de 60s).');
+
+    for (const fn of reactivateHandlers) { try { fn(); } catch {} }
   }
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -2318,7 +2331,6 @@
   async function measureLatency() {
     const rttSamples = [];
     const offsetSamples = [];
-    const rttBackSamples = [];   // localReceive - serverDate: estima rttBack + truncamento (~+500ms)
     for (let i = 0; i < 5; i++) {
       try {
         const tStart = Date.now();
@@ -2326,17 +2338,12 @@
         const r = await fetch('/game.php?screen=overview', { method: 'HEAD', credentials: 'include' });
         const t1 = performance.now();
         const tEnd = Date.now();
-        const rtt = t1 - t0;
-        rttSamples.push(rtt);
+        rttSamples.push(t1 - t0);
         const dateHeader = r.headers.get('Date');
         if (dateHeader) {
           const serverTs = new Date(dateHeader).getTime();
           const localMid = (tStart + tEnd) / 2;
           offsetSamples.push(serverTs - localMid);
-          // rttBack: tempo de descida (servidor→cliente). O header Date reflete quando o servidor
-          // enviou a resposta. rttBack = tEnd - serverTs, mas serverTs é truncado ao segundo,
-          // introduzindo viés de +0..+999ms. A mediana de muitas amostras ≈ rttBack + 500ms.
-          rttBackSamples.push(tEnd - serverTs);
         }
       } catch {}
       await sleep(120);
@@ -2348,15 +2355,10 @@
     };
     const avgRtt = median(rttSamples);
     const avgOffset = offsetSamples.length >= 3 ? median(offsetSamples) : 0;
-    // oneWay (uplink cliente→servidor) = rtt - rttBack_true.
-    // rttBackSamples = localReceive − serverDate ≈ rttBack_true − avgOffset + Uniform(0,1000).
-    // median ≈ rttBack_true − avgOffset + 500; após −500: rttBack_corr = rttBack_true − avgOffset.
-    // Portanto: rtt − rttBack_corr − avgOffset = rtt − rttBack_true = oneWay. Clamp [1, rtt−1].
-    let avgOneWay = Math.round(avgRtt / 2);  // fallback sem amostras suficientes
-    if (rttBackSamples.length >= 3) {
-      const rttBack = Math.max(1, median(rttBackSamples) - 500);
-      avgOneWay = Math.max(1, Math.min(Math.round(avgRtt) - 1, Math.round(avgRtt - rttBack - avgOffset)));
-    }
+    // oneWay = RTT/2 (assume rede simétrica). A estimativa via header Date é instável
+    // (1s de granularidade + viés de truncamento) e estava produzindo valores zerados.
+    // Manter simples e estável é melhor que tentativa de precisão que falha.
+    const avgOneWay = Math.max(1, Math.round(avgRtt / 2));
     return { avgRtt: Math.round(avgRtt), avgOffset: Math.round(avgOffset), avgOneWay };
   }
 
@@ -2381,26 +2383,42 @@
     await refreshLatency();
   }
 
-  // Converte timestamp do servidor em timestamp local (subtraindo o offset).
-  // Usado pra agendar setTimeout, que opera no relógio local do PC.
-  function serverToLocalTs(serverTs) {
-    return serverTs - (state.scheduler.latency.avgOffset || 0);
+  // Calibração empírica do viés do Timing do TW: getCurrentServerTime() vem ~250ms
+  // adiantado do server real (provável compensação errada do truncamento do Date header).
+  // Validado com testes reais (sem isso, ataques chegam ~250ms cedo).
+  // Ajuste fixo, não exposto — usuário não precisa mexer.
+  const BIAS_CALIBRATION_MS = 250;
+
+  // Offset (servidor − local) em ms. Prefere Timing nativo do TW (sub-ms, atualizado por
+  // WebSocket) com a calibração empírica subtraída. Fallback pro avgOffset do header Date.
+  function twServerOffset() {
+    const T = unsafeWindow.Timing;
+    if (T && typeof T.getCurrentServerTime === 'function') {
+      return T.getCurrentServerTime() - Date.now() - BIAS_CALIBRATION_MS;
+    }
+    return state.scheduler.latency.avgOffset || 0;
   }
 
-  // Hora atual do servidor em ms.
+  // Converte timestamp do servidor em timestamp local. Usado pra agendar setTimeout/Worker.
+  function serverToLocalTs(serverTs) {
+    return serverTs - twServerOffset();
+  }
+
+  // Hora atual do servidor em ms (sub-ms de precisão via Timing nativo, calibrado).
   function serverNow() {
+    const T = unsafeWindow.Timing;
+    if (T && typeof T.getCurrentServerTime === 'function') {
+      return T.getCurrentServerTime() - BIAS_CALIBRATION_MS;
+    }
     return Date.now() + (state.scheduler.latency.avgOffset || 0);
   }
 
-  // Tempo de antecipação: disparamos (oneWay − LATE_BIAS_MS) antes do executeAt.
-  // O bias de 25ms garante chegada ~25ms após executeAt — nunca antes.
-  // Preferência do usuário: até +50ms de atraso é aceitável; adiantado não é.
-  const LATE_BIAS_MS = 25;
+  // Tempo de antecipação (ms): disparamos `comp` ms antes do executeAt pra o POST chegar
+  // ao servidor exatamente em executeAt. Usa RTT/2 (média de 5 pings, atualizada a cada 5s).
   function latencyCompensation() {
     const lat = state.scheduler.latency;
     if (lat.manualOverride > 0) return lat.manualOverride;
-    const oneWay = lat.avgOneWay || Math.round((lat.avgRtt || 0) * 0.5);
-    return Math.max(1, oneWay - LATE_BIAS_MS);
+    return Math.max(1, lat.avgOneWay || Math.round((lat.avgRtt || 0) * 0.5));
   }
 
   // ticker de 5s: re-mede latência (não roda se há override manual)
@@ -2708,10 +2726,46 @@
   }
 
   // ---------- ui ----------
-  const COLOR_BG = '#121313';
-  const COLOR_ACCENT = '#FF6044';
+  const COLOR_BG = '#222831';
+  const COLOR_ACCENT = '#00ADB5';
 
   GM_addStyle(`
+    /* design tokens — paleta + spacing */
+    :root {
+      --mog-bg: #222831;
+      --mog-bg-deep: #1b1f25;
+      --mog-surface: #393E46;
+      --mog-surface-2: #2c333a;
+      --mog-surface-hover: #424952;
+      --mog-border: #4a5159;
+      --mog-border-soft: #2f353c;
+      --mog-accent: #00ADB5;
+      --mog-accent-hover: #00bfc8;
+      --mog-accent-soft: rgba(0, 173, 181, 0.12);
+      --mog-accent-strong: rgba(0, 173, 181, 0.28);
+      --mog-text: #EEEEEE;
+      --mog-text-dim: #a8b0b8;
+      --mog-text-mute: #6b7178;
+      --mog-success: #34d399;
+      --mog-success-soft: rgba(52, 211, 153, 0.18);
+      --mog-warn: #fbbf24;
+      --mog-warn-soft: rgba(251, 191, 36, 0.18);
+      --mog-error: #f87171;
+      --mog-error-soft: rgba(248, 113, 113, 0.18);
+      --mog-info: #7dd3fc;
+      --mog-info-soft: rgba(125, 211, 252, 0.18);
+
+      --mog-sp-1: 4px;
+      --mog-sp-2: 8px;
+      --mog-sp-3: 12px;
+      --mog-sp-4: 16px;
+      --mog-sp-5: 20px;
+      --mog-sp-6: 24px;
+
+      --mog-radius: 8px;
+      --mog-radius-sm: 6px;
+    }
+
     /* launcher lateral */
     .mog-launcher {
       position: fixed;
@@ -2721,7 +2775,7 @@
       width: 38px;
       height: 56px;
       background: ${COLOR_BG};
-      border: 1px solid #2a2b2b;
+      border: 1px solid var(--mog-border);
       border-left: none;
       border-radius: 0 12px 12px 0;
       cursor: pointer;
@@ -2738,12 +2792,12 @@
       transition: width 0.15s ease, color 0.15s ease, background 0.15s ease;
       user-select: none;
     }
-    .mog-launcher:hover { width: 46px; color: #fff; background: ${COLOR_ACCENT}; }
+    .mog-launcher:hover { width: 46px; color: var(--mog-bg); background: ${COLOR_ACCENT}; }
     .mog-launcher .mog-launcher-dot {
       position: absolute;
       bottom: 7px; right: 7px;
       width: 7px; height: 7px; border-radius: 50%;
-      background: #4a4b4b;
+      background: var(--mog-text-mute);
     }
     .mog-launcher.mog-active .mog-launcher-dot {
       background: ${COLOR_ACCENT};
@@ -2768,16 +2822,16 @@
       width: min(1180px, calc(100vw - 80px));
       height: calc(100vh - 64px);
       background: ${COLOR_BG};
-      color: #e6e6e6;
+      color: var(--mog-text);
       font-family: 'Segoe UI', system-ui, sans-serif;
       font-size: 13px;
-      border: 1px solid #2a2b2b;
+      border: 1px solid var(--mog-border);
       border-radius: 14px;
       box-shadow: 0 24px 60px rgba(0,0,0,0.6);
       z-index: 999999;
       display: grid;
       grid-template-columns: 220px 1fr;
-      grid-template-rows: 56px 1fr;
+      grid-template-rows: 60px 1fr;
       grid-template-areas:
         "head head"
         "side main";
@@ -2793,27 +2847,70 @@
     /* header */
     .mog-head {
       grid-area: head;
-      padding: 0 20px;
-      border-bottom: 1px solid #1f1f1f;
+      padding: 0 24px;
+      border-bottom: 1px solid var(--mog-border-soft);
       display: flex; align-items: center; gap: 14px;
     }
     .mog-logo {
       width: 32px; height: 32px; border-radius: 8px;
       background: ${COLOR_ACCENT};
       display: flex; align-items: center; justify-content: center;
-      color: #fff; font-weight: 800; font-size: 16px;
+      color: var(--mog-bg); font-weight: 800; font-size: 16px;
       flex-shrink: 0;
     }
-    .mog-title-name { font-weight: 700; font-size: 14px; color: #fafafa; line-height: 1.1; }
-    .mog-title-ver { font-size: 10px; color: #6b6b6b; letter-spacing: 0.5px; margin-top: 2px; }
+    .mog-title-name { font-weight: 700; font-size: 14px; color: var(--mog-text); line-height: 1.1; }
+    .mog-title-ver { font-size: 10px; color: var(--mog-text-mute); letter-spacing: 0.5px; margin-top: 2px; }
     .mog-head-spacer { flex: 1; }
+
+    /* chips read-only no header (latência, relógio, captcha) */
+    .mog-head-chips {
+      display: flex; align-items: center; gap: 8px;
+    }
+    .mog-chip {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 6px 11px;
+      border-radius: 999px;
+      background: var(--mog-surface-2);
+      color: var(--mog-text-dim);
+      border: 1px solid var(--mog-border);
+      font-size: 11px;
+      font-weight: 600;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      letter-spacing: 0.3px;
+      line-height: 1;
+      white-space: nowrap;
+      transition: all 0.15s;
+    }
+    .mog-chip[hidden] { display: none; }
+    .mog-chip-clock { font-variant-numeric: tabular-nums; }
+    .mog-chip-rtt { font-variant-numeric: tabular-nums; }
+    .mog-chip-rtt.mog-chip-ok { color: var(--mog-success); border-color: var(--mog-success-soft); }
+    .mog-chip-rtt.mog-chip-warn { color: var(--mog-warn); border-color: var(--mog-warn-soft); }
+    .mog-chip-rtt.mog-chip-error { color: var(--mog-error); border-color: var(--mog-error-soft); }
+    .mog-chip-captcha {
+      background: var(--mog-error-soft);
+      color: var(--mog-error);
+      border-color: var(--mog-error);
+      cursor: pointer;
+    }
+    .mog-chip-captcha:hover { filter: brightness(1.1); }
+    .mog-chip-captcha .mog-chip-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--mog-error);
+      box-shadow: 0 0 8px var(--mog-error);
+      animation: mog-chip-pulse 1.4s ease-in-out infinite;
+    }
+    @keyframes mog-chip-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
 
     .mog-toggle {
       padding: 8px 16px;
       border-radius: 999px;
-      background: #1a1b1b;
-      color: #888;
-      border: 1px solid #2a2b2b;
+      background: var(--mog-surface-2);
+      color: var(--mog-text-mute);
+      border: 1px solid var(--mog-border);
       cursor: pointer;
       font-size: 11px;
       font-weight: 700;
@@ -2823,26 +2920,26 @@
       transition: all 0.15s;
     }
     .mog-toggle::before {
-      content: ''; width: 7px; height: 7px; border-radius: 50%; background: #555;
+      content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--mog-text-mute);
     }
-    .mog-toggle.mog-on { background: ${COLOR_ACCENT}; color: #fff; border-color: ${COLOR_ACCENT}; }
+    .mog-toggle.mog-on { background: ${COLOR_ACCENT}; color: var(--mog-bg); border-color: ${COLOR_ACCENT}; }
     .mog-toggle.mog-on::before { background: #fff; box-shadow: 0 0 6px rgba(255,255,255,0.8); }
     .mog-toggle:hover { filter: brightness(1.1); }
 
     .mog-close {
-      background: none; border: none; color: #6b6b6b;
+      background: none; border: none; color: var(--mog-text-mute);
       font-size: 22px; cursor: pointer; line-height: 1;
       padding: 4px 8px; border-radius: 6px;
     }
-    .mog-close:hover { background: #1a1b1b; color: #fafafa; }
+    .mog-close:hover { background: var(--mog-surface-2); color: var(--mog-text); }
 
     /* sidebar */
     .mog-side {
       grid-area: side;
-      border-right: 1px solid #1f1f1f;
+      border-right: 1px solid var(--mog-border-soft);
       padding: 16px 0;
       overflow-y: auto;
-      background: #0f1010;
+      background: var(--mog-bg-deep);
     }
     .mog-side-section {
       margin-bottom: 18px;
@@ -2853,13 +2950,13 @@
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.7px;
-      color: #5a5b5b;
+      color: var(--mog-text-mute);
       display: flex; align-items: center; gap: 6px;
       cursor: pointer;
       user-select: none;
       transition: color 0.15s;
     }
-    .mog-side-title:hover { color: #aaa; }
+    .mog-side-title:hover { color: var(--mog-text-dim); }
     .mog-side-caret {
       display: inline-block;
       transition: transform 0.15s ease;
@@ -2882,13 +2979,13 @@
       display: flex; align-items: center; gap: 10px;
       padding: 9px 18px;
       cursor: pointer;
-      color: #aaa;
+      color: var(--mog-text-dim);
       font-size: 12.5px;
       font-weight: 500;
       border-left: 2px solid transparent;
       transition: all 0.15s;
     }
-    .mog-side-item:hover { background: #161717; color: #fafafa; }
+    .mog-side-item:hover { background: var(--mog-surface-2); color: var(--mog-text); }
     .mog-side-item.mog-side-active {
       color: ${COLOR_ACCENT};
       background: rgba(255,96,68,0.08);
@@ -2899,7 +2996,7 @@
       opacity: 0.35;
       cursor: not-allowed;
     }
-    .mog-side-item.mog-side-disabled:hover { background: transparent; color: #aaa; }
+    .mog-side-item.mog-side-disabled:hover { background: transparent; color: var(--mog-text-dim); }
     .mog-side-icon {
       width: 16px; height: 16px;
       display: inline-flex; align-items: center; justify-content: center;
@@ -2910,8 +3007,8 @@
       margin-left: auto;
       font-size: 9px;
       padding: 2px 6px;
-      background: #2a2b2b;
-      color: #888;
+      background: var(--mog-border);
+      color: var(--mog-text-mute);
       border-radius: 999px;
       letter-spacing: 0.4px;
       text-transform: uppercase;
@@ -2921,12 +3018,12 @@
       margin-left: auto;
       width: 7px; height: 7px;
       border-radius: 50%;
-      background: #2a2b2b;
+      background: var(--mog-border);
       flex: 0 0 auto;
       transition: background 0.2s, box-shadow 0.2s;
     }
     .mog-side-status.mog-side-status-on {
-      background: #4ade80;
+      background: var(--mog-success);
       box-shadow: 0 0 6px rgba(74, 222, 128, 0.6);
     }
 
@@ -2944,7 +3041,7 @@
       min-width: 0;
     }
     .mog-content::-webkit-scrollbar { width: 8px; }
-    .mog-content::-webkit-scrollbar-thumb { background: #2a2b2b; border-radius: 4px; }
+    .mog-content::-webkit-scrollbar-thumb { background: var(--mog-border); border-radius: 4px; }
     .mog-content::-webkit-scrollbar-thumb:hover { background: ${COLOR_ACCENT}; }
 
     .mog-section-head {
@@ -2952,15 +3049,15 @@
       margin-bottom: 16px;
     }
     .mog-section-head h2 {
-      margin: 0; font-size: 16px; font-weight: 700; color: #fafafa;
+      margin: 0; font-size: 16px; font-weight: 700; color: var(--mog-text);
       letter-spacing: 0.2px;
     }
     .mog-section-head p {
-      margin: 4px 0 0; font-size: 11.5px; color: #888;
+      margin: 4px 0 0; font-size: 11.5px; color: var(--mog-text-mute);
     }
 
     .mog-add-btn {
-      background: ${COLOR_ACCENT}; color: #fff; border: none;
+      background: ${COLOR_ACCENT}; color: var(--mog-bg); border: none;
       padding: 8px 14px; border-radius: 7px;
       font-size: 11px; font-weight: 700; cursor: pointer;
       letter-spacing: 0.3px; text-transform: uppercase;
@@ -2979,7 +3076,7 @@
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.5px;
-      color: #5a5b5b;
+      color: var(--mog-text-mute);
       min-width: 0;
       box-sizing: border-box;
     }
@@ -2991,8 +3088,8 @@
 
     /* row */
     .mog-prow {
-      background: #181919;
-      border: 1px solid #232424;
+      background: var(--mog-surface-2);
+      border: 1px solid var(--mog-border-soft);
       border-radius: 10px;
       margin-bottom: 10px;
       transition: border-color 0.15s, box-shadow 0.15s;
@@ -3013,12 +3110,12 @@
 
     .mog-tg {
       width: 34px; height: 18px; border-radius: 999px;
-      background: #2a2b2b; cursor: pointer; position: relative;
+      background: var(--mog-border); cursor: pointer; position: relative;
       transition: background 0.15s;
     }
     .mog-tg::after {
       content: ''; position: absolute; top: 2px; left: 2px;
-      width: 14px; height: 14px; border-radius: 50%; background: #888;
+      width: 14px; height: 14px; border-radius: 50%; background: var(--mog-text-mute);
       transition: all 0.15s;
     }
     .mog-prow.mog-prow-on .mog-tg { background: ${COLOR_ACCENT}; }
@@ -3026,16 +3123,16 @@
 
     .mog-pname {
       background: transparent; border: 1px solid transparent;
-      color: #fafafa; font-size: 13px; font-weight: 600;
+      color: var(--mog-text); font-size: 13px; font-weight: 600;
       padding: 7px 9px; border-radius: 6px;
       width: 100%; outline: none; box-sizing: border-box;
     }
-    .mog-pname:hover { background: #1f2020; }
-    .mog-pname:focus { background: #1f2020; border-color: ${COLOR_ACCENT}; }
+    .mog-pname:hover { background: var(--mog-surface-hover); }
+    .mog-pname:focus { background: var(--mog-surface-hover); border-color: ${COLOR_ACCENT}; }
 
     .mog-input, .mog-select {
-      background: #0e0f0f; border: 1px solid #2a2b2b;
-      border-radius: 6px; padding: 7px 6px; color: #e6e6e6;
+      background: var(--mog-bg-deep); border: 1px solid var(--mog-border);
+      border-radius: 6px; padding: 7px 6px; color: var(--mog-text);
       font-family: inherit; font-size: 12px; outline: none;
       width: 100%; min-width: 0; box-sizing: border-box; text-align: center;
     }
@@ -3055,24 +3152,24 @@
       padding: 9px 1px;
       font-size: 11.5px;
       font-weight: 600;
-      color: #fafafa;
+      color: var(--mog-text);
       text-align: center;
       letter-spacing: -0.3px;
       font-variant-numeric: tabular-nums;
       font-feature-settings: "tnum";
     }
     .mog-target.mog-target-off {
-      color: #555;
+      color: var(--mog-text-mute);
       font-weight: 400;
     }
     .mog-target:focus {
-      background: #181919;
-      color: #fafafa;
+      background: var(--mog-surface-2);
+      color: var(--mog-text);
     }
 
     .mog-interval {
       display: flex; gap: 4px; align-items: center; justify-content: center;
-      font-size: 11px; color: #888;
+      font-size: 11px; color: var(--mog-text-mute);
       min-width: 0;
     }
     .mog-interval input {
@@ -3081,7 +3178,7 @@
     }
 
     .mog-status-cell {
-      font-size: 10.5px; color: #888;
+      font-size: 10.5px; color: var(--mog-text-mute);
       text-align: center;
       min-width: 0;
       overflow: hidden;
@@ -3097,18 +3194,18 @@
     }
     .mog-iconbtn {
       background: transparent; border: 1px solid transparent;
-      color: #888; cursor: pointer;
+      color: var(--mog-text-mute); cursor: pointer;
       padding: 6px 8px; border-radius: 6px; font-size: 14px;
       line-height: 1; transition: all 0.15s;
     }
-    .mog-iconbtn:hover { background: #1f2020; color: #fafafa; }
-    .mog-iconbtn.mog-iconbtn-danger:hover { background: #3a1614; color: ${COLOR_ACCENT}; }
+    .mog-iconbtn:hover { background: var(--mog-surface-hover); color: var(--mog-text); }
+    .mog-iconbtn.mog-iconbtn-danger:hover { background: var(--mog-error-soft); color: ${COLOR_ACCENT}; }
 
     .mog-prow-expand {
-      border-top: 1px solid #232424;
+      border-top: 1px solid var(--mog-border-soft);
       padding: 14px 16px;
       display: none;
-      background: #141515;
+      background: var(--mog-bg-deep);
       border-radius: 0 0 10px 10px;
     }
     .mog-prow.mog-prow-expanded .mog-prow-expand { display: block; }
@@ -3124,59 +3221,59 @@
     .mog-template-preview { margin-top: 4px; }
     .mog-seq-table {
       width: 100%; border-collapse: collapse;
-      font-size: 12.5px; color: #cfd0d0;
+      font-size: 12.5px; color: var(--mog-text-dim);
     }
     .mog-seq-table thead th {
       text-align: left; padding: 3px 8px;
       font-size: 11px; font-weight: 700; text-transform: uppercase;
-      color: #888; border-bottom: 1px solid #2a2b2b;
+      color: var(--mog-text-mute); border-bottom: 1px solid var(--mog-border);
     }
-    .mog-seq-table tbody tr:nth-child(even) { background: #181919; }
-    .mog-seq-table tbody tr:hover { background: #1e1f1f; }
+    .mog-seq-table tbody tr:nth-child(even) { background: var(--mog-surface-2); }
+    .mog-seq-table tbody tr:hover { background: var(--mog-surface-hover); }
     .mog-seq-table td { padding: 3px 8px; }
-    .mog-seq-num  { color: #888; font-size: 11px; white-space: nowrap; min-width: 36px; }
+    .mog-seq-num  { color: var(--mog-text-mute); font-size: 11px; white-space: nowrap; min-width: 36px; }
     .mog-seq-icon { font-size: 14px; width: 22px; }
     .mog-seq-count { color: ${COLOR_ACCENT}; font-weight: 600; text-align: right; }
-    .mog-seq-more  { color: #888; font-size: 11px; padding: 4px 8px; }
+    .mog-seq-more  { color: var(--mog-text-mute); font-size: 11px; padding: 4px 8px; }
     .mog-tpl-more { color: ${COLOR_ACCENT}; font-weight: 600; }
     .mog-import-block {
-      background: #181919; border: 1px solid #232424;
+      background: var(--mog-surface-2); border: 1px solid var(--mog-border-soft);
       border-radius: 8px; padding: 14px; margin-bottom: 14px;
     }
     .mog-import-block textarea {
       width: 100%; box-sizing: border-box;
-      background: #0f1010; border: 1px solid #2a2b2b;
-      color: #d8d8d8; border-radius: 6px; padding: 8px;
+      background: var(--mog-bg-deep); border: 1px solid var(--mog-border);
+      color: var(--mog-text); border-radius: 6px; padding: 8px;
       font-family: monospace; font-size: 11.5px;
       resize: vertical; min-height: 50px;
     }
-    .mog-import-msg { font-size: 12px; color: #6b6b6b; align-self: center; }
-    .mog-import-msg.mog-import-err { color: #ff6044; }
+    .mog-import-msg { font-size: 12px; color: var(--mog-text-mute); align-self: center; }
+    .mog-import-msg.mog-import-err { color: var(--mog-error); }
     .mog-templates-list { display: flex; flex-direction: column; gap: 8px; }
     .mog-tpl-row {
-      background: #181919; border: 1px solid #232424;
+      background: var(--mog-surface-2); border: 1px solid var(--mog-border-soft);
       border-radius: 8px; padding: 10px 14px;
     }
     .mog-tpl-head {
       display: grid; grid-template-columns: minmax(150px, 1fr) auto 80px;
       gap: 10px; align-items: center;
     }
-    .mog-tpl-meta { font-size: 11px; color: #6b6b6b; text-align: right; }
+    .mog-tpl-meta { font-size: 11px; color: var(--mog-text-mute); text-align: right; }
     .mog-tpl-preview { margin-top: 8px; }
     .mog-btn-on {
       background: ${COLOR_ACCENT} !important;
-      color: #fff !important;
+      color: var(--mog-bg) !important;
       border-color: ${COLOR_ACCENT} !important;
     }
     .mog-label {
       display: block; font-size: 11px; font-weight: 700;
-      text-transform: uppercase; color: #888; letter-spacing: 0.4px;
+      text-transform: uppercase; color: var(--mog-text-mute); letter-spacing: 0.4px;
       margin-bottom: 6px;
     }
 
     .mog-bgroups { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
     .mog-bgroup {
-      background: #1a1b1b; border: 1px solid #232424;
+      background: var(--mog-surface-2); border: 1px solid var(--mog-border-soft);
       border-radius: 8px; padding: 14px 16px;
       display: flex; flex-direction: column;
     }
@@ -3185,7 +3282,7 @@
       color: ${COLOR_ACCENT}; letter-spacing: 0.5px; margin-bottom: 4px;
     }
     .mog-bgroup-units {
-      font-size: 10.5px; color: #6b6b6b; margin-bottom: 12px;
+      font-size: 10.5px; color: var(--mog-text-mute); margin-bottom: 12px;
       line-height: 1.4;
     }
     .mog-bgroup-fields {
@@ -3193,10 +3290,10 @@
       margin-top: auto;
     }
     .mog-bunit-cell { display: flex; flex-direction: column; gap: 4px; }
-    .mog-bunit-cell label { font-size: 9.5px; color: #888; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600; }
+    .mog-bunit-cell label { font-size: 9.5px; color: var(--mog-text-mute); text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600; }
     .mog-bunit-cell input {
-      background: #0e0f0f; border: 1px solid #2a2b2b;
-      border-radius: 6px; padding: 7px 8px; color: #e6e6e6;
+      background: var(--mog-bg-deep); border: 1px solid var(--mog-border);
+      border-radius: 6px; padding: 7px 8px; color: var(--mog-text);
       font-family: inherit; font-size: 12px; outline: none;
       width: 100%; box-sizing: border-box; text-align: center;
     }
@@ -3206,75 +3303,75 @@
       display: flex; gap: 8px; margin-top: 14px; justify-content: flex-end;
     }
     .mog-btn {
-      background: ${COLOR_ACCENT}; color: #fff; border: none;
-      padding: 8px 16px; border-radius: 7px;
-      font-size: 11px; font-weight: 700; cursor: pointer;
+      background: ${COLOR_ACCENT}; color: var(--mog-bg); border: none;
+      padding: 9px 18px; border-radius: 7px;
+      font-size: 13px; font-weight: 700; cursor: pointer;
       letter-spacing: 0.3px; text-transform: uppercase;
       transition: filter 0.15s;
     }
     .mog-btn:hover { filter: brightness(1.1); }
-    .mog-btn.mog-btn-ghost { background: #1f2020; color: #ccc; }
-    .mog-btn.mog-btn-ghost:hover { background: #2a2b2b; color: #fff; filter: none; }
+    .mog-btn.mog-btn-ghost { background: var(--mog-surface-hover); color: var(--mog-text-dim); }
+    .mog-btn.mog-btn-ghost:hover { background: var(--mog-border); color: #fff; filter: none; }
 
     .mog-empty {
-      text-align: center; color: #6b6b6b; padding: 36px 16px;
+      text-align: center; color: var(--mog-text-mute); padding: 36px 16px;
       font-size: 12px; font-style: italic;
-      background: #181919;
-      border: 1px dashed #2a2b2b;
+      background: var(--mog-surface-2);
+      border: 1px dashed var(--mog-border);
       border-radius: 10px;
     }
 
     .mog-placeholder {
-      text-align: center; padding: 80px 20px; color: #6b6b6b;
+      text-align: center; padding: 80px 20px; color: var(--mog-text-mute);
     }
     .mog-placeholder-icon { font-size: 36px; margin-bottom: 12px; }
-    .mog-placeholder-title { color: #aaa; font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+    .mog-placeholder-title { color: var(--mog-text-dim); font-size: 14px; font-weight: 600; margin-bottom: 4px; }
     .mog-placeholder-text { font-size: 12px; }
 
     /* wizard (Agendador) */
     .mog-wiz-head {
       display: flex; align-items: center; gap: 12px;
       padding-bottom: 14px; margin-bottom: 16px;
-      border-bottom: 1px solid #1f1f1f;
+      border-bottom: 1px solid var(--mog-border-soft);
     }
     .mog-wiz-back {
-      background: transparent; border: 1px solid #2a2b2b;
-      color: #aaa; padding: 6px 12px; border-radius: 6px;
+      background: transparent; border: 1px solid var(--mog-border);
+      color: var(--mog-text-dim); padding: 6px 12px; border-radius: 6px;
       font-size: 11px; cursor: pointer; font-weight: 600;
     }
-    .mog-wiz-back:hover { color: #fafafa; border-color: #3a3b3b; }
-    .mog-wiz-title { font-size: 14px; font-weight: 700; color: #fafafa; flex: 1; }
+    .mog-wiz-back:hover { color: var(--mog-text); border-color: var(--mog-border); }
+    .mog-wiz-title { font-size: 14px; font-weight: 700; color: var(--mog-text); flex: 1; }
     .mog-wiz-name {
       background: transparent; border: 1px solid transparent;
-      color: #fafafa; font-size: 14px; font-weight: 700;
+      color: var(--mog-text); font-size: 14px; font-weight: 700;
       padding: 4px 8px; border-radius: 5px;
       flex: 1; outline: none; min-width: 200px;
     }
-    .mog-wiz-name:hover { background: #1f2020; }
-    .mog-wiz-name:focus { background: #1f2020; border-color: ${COLOR_ACCENT}; }
+    .mog-wiz-name:hover { background: var(--mog-surface-hover); }
+    .mog-wiz-name:focus { background: var(--mog-surface-hover); border-color: ${COLOR_ACCENT}; }
     .mog-wiz-steps { display: flex; gap: 4px; align-items: center; }
     .mog-wiz-step {
       display: flex; align-items: center; gap: 6px;
-      font-size: 11px; color: #6b6b6b; font-weight: 600;
+      font-size: 11px; color: var(--mog-text-mute); font-weight: 600;
       padding: 5px 10px; border-radius: 999px;
-      background: #1a1b1b; border: 1px solid #2a2b2b;
+      background: var(--mog-surface-2); border: 1px solid var(--mog-border);
     }
     .mog-wiz-step.mog-wiz-step-active {
-      color: #fff; background: ${COLOR_ACCENT}; border-color: ${COLOR_ACCENT};
+      color: var(--mog-bg); background: ${COLOR_ACCENT}; border-color: ${COLOR_ACCENT};
     }
-    .mog-wiz-step.mog-wiz-step-done { color: #a0a0a0; }
+    .mog-wiz-step.mog-wiz-step-done { color: var(--mog-text-dim); }
     .mog-wiz-step-num {
       width: 18px; height: 18px; border-radius: 50%;
-      background: #2a2b2b; color: #888; font-size: 10px;
+      background: var(--mog-border); color: var(--mog-text-mute); font-size: 10px;
       display: inline-flex; align-items: center; justify-content: center;
       font-weight: 700;
     }
     .mog-wiz-step.mog-wiz-step-active .mog-wiz-step-num { background: #fff; color: ${COLOR_ACCENT}; }
-    .mog-wiz-step-sep { color: #3a3b3b; font-size: 11px; }
+    .mog-wiz-step-sep { color: var(--mog-border); font-size: 11px; }
 
     .mog-wiz-section {
-      background: #181919;
-      border: 1px solid #232424;
+      background: var(--mog-surface-2);
+      border: 1px solid var(--mog-border-soft);
       border-radius: 10px;
       padding: 16px;
       margin-bottom: 14px;
@@ -3287,8 +3384,8 @@
 
     .mog-wiz-textarea {
       width: 100%; box-sizing: border-box;
-      background: #0e0f0f; border: 1px solid #2a2b2b;
-      border-radius: 6px; padding: 10px 12px; color: #e6e6e6;
+      background: var(--mog-bg-deep); border: 1px solid var(--mog-border);
+      border-radius: 6px; padding: 10px 12px; color: var(--mog-text);
       font-family: 'JetBrains Mono', 'Consolas', monospace;
       font-size: 12px; line-height: 1.5; outline: none;
       resize: vertical; min-height: 80px;
@@ -3296,45 +3393,79 @@
     .mog-wiz-textarea:focus { border-color: ${COLOR_ACCENT}; }
 
     .mog-wiz-row { display: flex; gap: 10px; align-items: center; margin-top: 10px; }
-    .mog-wiz-hint { font-size: 11px; color: #6b6b6b; flex: 1; }
+    .mog-wiz-hint { font-size: 11px; color: var(--mog-text-mute); flex: 1; }
 
     /* tabela de alvos */
     .mog-tg-head, .mog-tg-row {
       display: grid;
-      grid-template-columns: 90px 1fr 60px 1fr 50px 50px 50px 36px;
+      grid-template-columns: 90px 1fr 70px 60px 60px 60px 36px;
       gap: 8px;
       align-items: center;
       padding: 8px 10px;
     }
+    .mog-tg-row .mog-tg-arrival {
+      font-family: 'JetBrains Mono', 'Consolas', monospace;
+      font-size: 11.5px; color: var(--mog-text-dim);
+      text-align: center;
+    }
+    /* layout da seção "Padrão de chegada" */
+    .mog-wiz-default-arrival {
+      display: flex; gap: 12px; align-items: stretch;
+    }
+    .mog-wiz-fld { display: flex; flex-direction: column; gap: 4px; }
+    .mog-wiz-fld label {
+      font-size: 10.5px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.4px; color: var(--mog-text-mute);
+    }
+    .mog-wiz-fld input[type="text"],
+    .mog-wiz-fld input[type="datetime-local"],
+    .mog-wiz-fld input[type="number"] {
+      background: var(--mog-bg-deep); border: 1px solid var(--mog-border);
+      border-radius: 6px; padding: 8px 10px; color: var(--mog-text);
+      font-family: 'JetBrains Mono', 'Consolas', monospace; font-size: 12px; outline: none;
+      width: 100%; box-sizing: border-box;
+    }
+    .mog-wiz-fld input[type="text"]:focus,
+    .mog-wiz-fld input[type="datetime-local"]:focus,
+    .mog-wiz-fld input[type="number"]:focus { border-color: ${COLOR_ACCENT}; }
+    .mog-wiz-fld input.mog-input-error,
+    .mog-wiz-fld input.mog-input-error:focus { border-color: var(--mog-error); }
+    .mog-wiz-fld input[type="number"] {
+      -moz-appearance: textfield; text-align: center; font-weight: 600;
+    }
+    .mog-wiz-fld input[type="number"]::-webkit-inner-spin-button,
+    .mog-wiz-fld input[type="number"]::-webkit-outer-spin-button {
+      -webkit-appearance: none; margin: 0;
+    }
     .mog-tg-head {
       font-size: 10px; font-weight: 700; text-transform: uppercase;
-      letter-spacing: 0.5px; color: #6b6b6b;
-      border-bottom: 1px solid #232424;
+      letter-spacing: 0.5px; color: var(--mog-text-mute);
+      border-bottom: 1px solid var(--mog-border-soft);
     }
     .mog-tg-head > div { text-align: center; }
     .mog-tg-head > div:nth-child(1) { text-align: left; }
     .mog-tg-row {
-      background: #141515;
-      border: 1px solid #232424;
+      background: var(--mog-bg-deep);
+      border: 1px solid var(--mog-border-soft);
       border-radius: 8px;
       margin-top: 6px;
     }
-    .mog-tg-row.mog-tg-invalid { border-color: #5b2a26; }
+    .mog-tg-row.mog-tg-invalid { border-color: var(--mog-error); }
     .mog-tg-row .mog-tg-coords {
       font-family: 'JetBrains Mono', 'Consolas', monospace;
       font-weight: 600; color: ${COLOR_ACCENT};
       font-size: 12.5px;
     }
     .mog-tg-row input[type="datetime-local"] {
-      background: #0e0f0f; border: 1px solid #2a2b2b;
-      border-radius: 5px; padding: 6px 8px; color: #e6e6e6;
+      background: var(--mog-bg-deep); border: 1px solid var(--mog-border);
+      border-radius: 5px; padding: 6px 8px; color: var(--mog-text);
       font-family: inherit; font-size: 11.5px; outline: none;
       width: 100%; min-width: 0; box-sizing: border-box;
     }
     .mog-tg-row input[type="datetime-local"]:focus { border-color: ${COLOR_ACCENT}; }
     .mog-tg-row input[type="number"] {
-      background: #0e0f0f; border: 1px solid #2a2b2b;
-      border-radius: 5px; padding: 7px 4px; color: #fafafa;
+      background: var(--mog-bg-deep); border: 1px solid var(--mog-border);
+      border-radius: 5px; padding: 7px 4px; color: var(--mog-text);
       font-size: 12px; font-weight: 600; outline: none;
       width: 100%; min-width: 0; box-sizing: border-box; text-align: center;
       -moz-appearance: textfield;
@@ -3345,7 +3476,7 @@
       -webkit-appearance: none; margin: 0;
     }
     .mog-tg-empty {
-      text-align: center; color: #555; padding: 24px;
+      text-align: center; color: var(--mog-text-mute); padding: 24px;
       font-size: 12px; font-style: italic;
     }
 
@@ -3353,14 +3484,14 @@
       display: flex; gap: 10px; align-items: center;
       margin-top: 18px;
       padding-top: 14px;
-      border-top: 1px solid #1f1f1f;
+      border-top: 1px solid var(--mog-border-soft);
     }
     .mog-wiz-foot-spacer { flex: 1; }
 
     /* lista de operações */
     .mog-op-card {
-      background: #181919;
-      border: 1px solid #232424;
+      background: var(--mog-surface-2);
+      border: 1px solid var(--mog-border-soft);
       border-radius: 10px;
       padding: 14px 16px;
       margin-bottom: 10px;
@@ -3370,28 +3501,37 @@
       align-items: center;
     }
     .mog-op-card.mog-op-executing { border-color: ${COLOR_ACCENT}; }
-    .mog-op-name { font-size: 13.5px; font-weight: 700; color: #fafafa; }
-    .mog-op-meta { font-size: 11px; color: #888; margin-top: 3px; }
+    .mog-op-name { font-size: 13.5px; font-weight: 700; color: var(--mog-text); }
+    .mog-op-meta { font-size: 11px; color: var(--mog-text-mute); margin-top: 3px; }
     .mog-op-status {
       font-size: 11px; font-weight: 600;
       text-align: center;
       padding: 5px 10px; border-radius: 999px;
-      background: #1f2020; color: #aaa;
+      background: var(--mog-surface-hover); color: var(--mog-text-dim);
       text-transform: uppercase; letter-spacing: 0.4px;
     }
-    .mog-op-status.mog-op-status-draft { background: #2a2b2b; color: #999; }
-    .mog-op-status.mog-op-status-calculated { background: #1d2a3a; color: #6cb3ff; }
-    .mog-op-status.mog-op-status-executing { background: ${COLOR_ACCENT}; color: #fff; }
-    .mog-op-status.mog-op-status-done { background: #1d3a23; color: #4ade80; }
-    .mog-op-status.mog-op-status-aborted { background: #3a1614; color: #ff8a7a; }
+    .mog-op-status.mog-op-status-draft { background: var(--mog-border); color: var(--mog-text-mute); }
+    .mog-op-status.mog-op-status-calculated { background: var(--mog-info-soft); color: var(--mog-info); }
+    .mog-op-status.mog-op-status-executing { background: ${COLOR_ACCENT}; color: var(--mog-bg); }
+    .mog-op-status.mog-op-status-done { background: var(--mog-success-soft); color: var(--mog-success); }
+    .mog-op-status.mog-op-status-aborted { background: var(--mog-error-soft); color: var(--mog-error); }
     .mog-op-actions { display: flex; gap: 6px; }
 
     /* lotes (passo 2) */
     .mog-lot {
-      background: #181919;
-      border: 1px solid #232424;
+      background: var(--mog-surface-2);
+      border: 1px solid var(--mog-border-soft);
       border-radius: 10px;
       margin-bottom: 12px;
+    }
+    /* quando dentro de mog-wiz-section, o lot card herda a moldura — sem dupla borda */
+    .mog-wiz-section > .mog-lot.mog-lot-inline {
+      background: transparent;
+      border: none;
+      margin: 0;
+    }
+    .mog-wiz-section > .mog-lot.mog-lot-inline > .mog-lot-body {
+      padding: 0;
     }
     .mog-lot-head {
       display: grid;
@@ -3402,33 +3542,33 @@
       cursor: pointer;
       border-bottom: 1px solid transparent;
     }
-    .mog-lot.mog-lot-open .mog-lot-head { border-bottom-color: #232424; }
+    .mog-lot.mog-lot-open .mog-lot-head { border-bottom-color: var(--mog-border-soft); }
     .mog-lot-caret {
       display: inline-block;
       transition: transform 0.15s ease;
       font-size: 10px;
-      color: #6b6b6b;
+      color: var(--mog-text-mute);
     }
     .mog-lot.mog-lot-open .mog-lot-caret { transform: rotate(90deg); }
     .mog-lot-name {
       background: transparent; border: 1px solid transparent;
-      color: #fafafa; font-size: 13px; font-weight: 600;
+      color: var(--mog-text); font-size: 13px; font-weight: 600;
       padding: 5px 8px; border-radius: 5px;
       width: 100%; outline: none; box-sizing: border-box;
     }
-    .mog-lot-name:hover { background: #1f2020; }
-    .mog-lot-name:focus { background: #1f2020; border-color: ${COLOR_ACCENT}; }
+    .mog-lot-name:hover { background: var(--mog-surface-hover); }
+    .mog-lot-name:focus { background: var(--mog-surface-hover); border-color: ${COLOR_ACCENT}; }
     .mog-lot-meta {
-      font-size: 11px; color: #6b6b6b; text-align: right;
+      font-size: 11px; color: var(--mog-text-mute); text-align: right;
     }
     .mog-lot-type {
       padding: 4px 10px; border-radius: 999px;
       font-size: 10px; font-weight: 700; text-transform: uppercase;
       letter-spacing: 0.4px; text-align: center;
-      background: #1f2020; color: #aaa;
+      background: var(--mog-surface-hover); color: var(--mog-text-dim);
     }
-    .mog-lot-type.mog-lot-type-attack { background: #3a1614; color: #ff8a7a; }
-    .mog-lot-type.mog-lot-type-support { background: #1d3a23; color: #4ade80; }
+    .mog-lot-type.mog-lot-type-attack { background: var(--mog-error-soft); color: var(--mog-error); }
+    .mog-lot-type.mog-lot-type-support { background: var(--mog-success-soft); color: var(--mog-success); }
 
     .mog-lot-body { padding: 14px; display: none; }
     .mog-lot.mog-lot-open .mog-lot-body { display: block; }
@@ -3443,7 +3583,7 @@
       margin-bottom: 10px;
     }
     .mog-lot-fld label {
-      font-size: 10px; color: #888; text-transform: uppercase;
+      font-size: 10px; color: var(--mog-text-mute); text-transform: uppercase;
       letter-spacing: 0.4px; font-weight: 600;
     }
     .mog-lot-import-row {
@@ -3454,30 +3594,30 @@
 
     .mog-lot-villages {
       max-height: 100px; overflow-y: auto;
-      background: #0e0f0f; border: 1px solid #232424;
+      background: var(--mog-bg-deep); border: 1px solid var(--mog-border-soft);
       border-radius: 6px; padding: 8px 10px;
       font-family: 'JetBrains Mono', 'Consolas', monospace;
-      font-size: 11px; color: #aaa; line-height: 1.6;
+      font-size: 11px; color: var(--mog-text-dim); line-height: 1.6;
     }
     textarea.mog-lot-villages-edit {
       width: 100%; min-height: 60px;
       box-sizing: border-box;
       resize: vertical;
-      outline: none; color: #fafafa;
+      outline: none; color: var(--mog-text);
       white-space: normal;
       word-spacing: 4px;
     }
     textarea.mog-lot-villages-edit:focus { border-color: ${COLOR_ACCENT}; }
     textarea.mog-lot-villages-edit::placeholder {
-      color: #555; font-style: italic;
+      color: var(--mog-text-mute); font-style: italic;
     }
     .mog-lot-villages::-webkit-scrollbar { width: 6px; }
-    .mog-lot-villages::-webkit-scrollbar-thumb { background: #2a2b2b; border-radius: 3px; }
+    .mog-lot-villages::-webkit-scrollbar-thumb { background: var(--mog-border); border-radius: 3px; }
 
     /* waves (comandos por origem→alvo) */
     .mog-wave {
-      background: #141515;
-      border: 1px solid #232424;
+      background: var(--mog-bg-deep);
+      border: 1px solid var(--mog-border-soft);
       border-radius: 8px;
       padding: 10px 12px;
       margin-bottom: 8px;
@@ -3494,7 +3634,7 @@
       letter-spacing: 0.4px;
     }
     .mog-wave-num-label {
-      font-size: 9px; color: #6b6b6b; text-transform: uppercase;
+      font-size: 9px; color: var(--mog-text-mute); text-transform: uppercase;
       letter-spacing: 0.4px; font-weight: 700;
     }
     .mog-wave-grid {
@@ -3510,7 +3650,7 @@
     }
     .mog-wave-add {
       background: transparent;
-      border: 1px dashed #3a3b3b;
+      border: 1px dashed var(--mog-border);
       color: ${COLOR_ACCENT};
       padding: 8px 14px;
       border-radius: 8px;
@@ -3528,52 +3668,59 @@
     }
     .mog-cmd-toolbar .mog-wiz-hint { flex: 1; }
     .mog-cmd-summary {
-      background: #181919;
-      border: 1px solid #232424;
+      background: var(--mog-surface-2);
+      border: 1px solid var(--mog-border-soft);
       border-radius: 10px;
       padding: 10px 14px;
       margin-bottom: 14px;
       display: flex; gap: 16px;
-      font-size: 11.5px; color: #aaa;
+      font-size: 11.5px; color: var(--mog-text-dim);
     }
-    .mog-cmd-summary strong { color: #fafafa; font-weight: 700; }
+    .mog-cmd-summary strong { color: var(--mog-text); font-weight: 700; }
     .mog-cmd-summary-pill {
       padding: 3px 10px; border-radius: 999px;
       font-weight: 700; letter-spacing: 0.4px;
       text-transform: uppercase; font-size: 10px;
     }
-    .mog-cmd-summary-ok { background: #1d3a23; color: #4ade80; }
-    .mog-cmd-summary-warn { background: #3a3014; color: #fbbf24; }
-    .mog-cmd-summary-err { background: #3a1614; color: #ff8a7a; }
+    .mog-cmd-summary-ok { background: var(--mog-success-soft); color: var(--mog-success); }
+    .mog-cmd-summary-warn { background: var(--mog-warn-soft); color: var(--mog-warn); }
+    .mog-cmd-summary-err { background: var(--mog-error-soft); color: var(--mog-error); }
 
     .mog-cmd-table {
-      background: #141515;
-      border: 1px solid #232424;
+      background: var(--mog-bg-deep);
+      border: 1px solid var(--mog-border-soft);
       border-radius: 10px;
       overflow: hidden;
       margin-bottom: 14px;
     }
     .mog-cmd-thead, .mog-cmd-row {
       display: grid;
-      grid-template-columns: 24px 90px 90px 1.6fr 60px 70px 110px 70px 110px 30px;
+      grid-template-columns: 90px 90px 1.6fr 60px 70px 150px 70px 150px 30px;
       gap: 6px; align-items: center;
       padding: 8px 10px;
       font-size: 11px;
     }
     .mog-cmd-thead {
       font-size: 9.5px; font-weight: 700; text-transform: uppercase;
-      letter-spacing: 0.5px; color: #6b6b6b;
-      background: #181919;
-      border-bottom: 1px solid #232424;
+      letter-spacing: 0.5px; color: var(--mog-text-mute);
+      background: var(--mog-surface-2);
+      border-bottom: 1px solid var(--mog-border-soft);
       padding-top: 10px; padding-bottom: 10px;
     }
     .mog-cmd-thead > div { text-align: center; }
-    .mog-cmd-thead > div:nth-child(4) { text-align: left; }
+    .mog-cmd-thead > div:nth-child(3) { text-align: left; }
     .mog-cmd-row {
-      border-top: 1px solid #1f1f1f;
+      border-top: 1px solid var(--mog-border-soft);
+      position: relative;
     }
     .mog-cmd-row:first-child { border-top: none; }
-    .mog-cmd-row:hover { background: #181919; }
+    .mog-cmd-row:hover { background: var(--mog-surface-2); }
+    /* tarja vermelha esquerda: indica comando inválido (atrasado) */
+    .mog-cmd-row-late {
+      background: var(--mog-error-soft);
+      box-shadow: inset 4px 0 0 0 var(--mog-error);
+    }
+    .mog-cmd-row-late:hover { background: var(--mog-error-soft); }
     .mog-cmd-row > div { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .mog-cmd-row .mog-cmd-units { white-space: normal; line-height: 1.4; font-size: 10.5px; }
     .mog-cmd-row .mog-cmd-units img {
@@ -3587,12 +3734,12 @@
     }
     .mog-cmd-row .mog-cmd-arr {
       font-family: 'JetBrains Mono', 'Consolas', monospace;
-      font-size: 10.5px; color: #ccc; text-align: center;
+      font-size: 10.5px; color: var(--mog-text-dim); text-align: center;
     }
     .mog-cmd-row input[type="number"] {
       width: 100%; box-sizing: border-box;
-      background: #0e0f0f; border: 1px solid #2a2b2b;
-      border-radius: 5px; padding: 5px 4px; color: #fafafa;
+      background: var(--mog-bg-deep); border: 1px solid var(--mog-border);
+      border-radius: 5px; padding: 5px 4px; color: var(--mog-text);
       font-size: 11.5px; text-align: center; outline: none;
       font-variant-numeric: tabular-nums;
       -moz-appearance: textfield;
@@ -3607,20 +3754,20 @@
       letter-spacing: 0.4px; padding: 3px 6px; border-radius: 4px;
       text-align: center;
     }
-    .mog-cmd-st-ok { background: #1d3a23; color: #4ade80; }
-    .mog-cmd-st-late { background: #3a3014; color: #fbbf24; }
-    .mog-cmd-st-err { background: #3a1614; color: #ff8a7a; }
+    .mog-cmd-st-ok { background: var(--mog-success-soft); color: var(--mog-success); }
+    .mog-cmd-st-late { background: var(--mog-warn-soft); color: var(--mog-warn); }
+    .mog-cmd-st-err { background: var(--mog-error-soft); color: var(--mog-error); }
 
     .mog-unreach {
-      background: #1d1112; border: 1px solid #3a1614;
+      background: var(--mog-error-soft); border: 1px solid var(--mog-error-soft);
       border-radius: 10px; padding: 12px 14px;
       margin-bottom: 14px;
     }
     .mog-unreach-title {
       font-size: 11px; font-weight: 700; text-transform: uppercase;
-      letter-spacing: 0.5px; color: #ff8a7a; margin-bottom: 8px;
+      letter-spacing: 0.5px; color: var(--mog-error); margin-bottom: 8px;
     }
-    .mog-unreach ul { margin: 0; padding-left: 18px; font-size: 11px; color: #ccc; }
+    .mog-unreach ul { margin: 0; padding-left: 18px; font-size: 11px; color: var(--mog-text-dim); }
     .mog-unreach li { padding: 1px 0; }
 
     /* passo 4 — confirmar */
@@ -3631,8 +3778,8 @@
       margin-bottom: 14px;
     }
     .mog-confirm-stat {
-      background: #181919;
-      border: 1px solid #232424;
+      background: var(--mog-surface-2);
+      border: 1px solid var(--mog-border-soft);
       border-radius: 10px;
       padding: 14px 16px;
       text-align: center;
@@ -3643,39 +3790,39 @@
       font-variant-numeric: tabular-nums;
     }
     .mog-confirm-stat-label {
-      font-size: 10px; color: #6b6b6b;
+      font-size: 10px; color: var(--mog-text-mute);
       text-transform: uppercase; letter-spacing: 0.5px;
       font-weight: 700; margin-top: 4px;
     }
     .mog-confirm-warn {
-      background: #3a3014;
-      border: 1px solid #fbbf24;
+      background: var(--mog-warn-soft);
+      border: 1px solid var(--mog-warn);
       border-radius: 10px;
       padding: 12px 14px;
       margin-bottom: 14px;
       display: flex; gap: 12px; align-items: flex-start;
-      font-size: 12px; color: #fbbf24;
+      font-size: 12px; color: var(--mog-warn);
       line-height: 1.5;
     }
     .mog-confirm-warn-icon { font-size: 18px; flex-shrink: 0; line-height: 1; }
     .mog-confirm-warn strong { color: #fff; }
     .mog-confirm-window {
-      background: #181919;
-      border: 1px solid #232424;
+      background: var(--mog-surface-2);
+      border: 1px solid var(--mog-border-soft);
       border-radius: 10px;
       padding: 14px 16px;
       margin-bottom: 14px;
     }
     .mog-confirm-window-title {
       font-size: 11px; font-weight: 700; text-transform: uppercase;
-      color: #888; letter-spacing: 0.5px; margin-bottom: 8px;
+      color: var(--mog-text-mute); letter-spacing: 0.5px; margin-bottom: 8px;
     }
     .mog-confirm-window-row {
       display: flex; justify-content: space-between; align-items: center;
-      padding: 4px 0; font-size: 12px; color: #ccc;
+      padding: 4px 0; font-size: 12px; color: var(--mog-text-dim);
     }
     .mog-confirm-window-row strong {
-      color: #fafafa; font-weight: 700;
+      color: var(--mog-text); font-weight: 700;
       font-family: 'JetBrains Mono', 'Consolas', monospace;
     }
     .mog-activate-btn {
@@ -3694,14 +3841,14 @@
     }
     .mog-activate-btn:hover { filter: brightness(1.12); }
     .mog-activate-btn:disabled {
-      background: #2a2b2b; color: #6b6b6b; cursor: not-allowed;
+      background: var(--mog-border); color: var(--mog-text-mute); cursor: not-allowed;
       filter: none;
     }
 
     /* painel de agendamentos (dashboard) */
     .mog-dash-toolbar {
-      background: #181919;
-      border: 1px solid #232424;
+      background: var(--mog-surface-2);
+      border: 1px solid var(--mog-border-soft);
       border-radius: 10px;
       padding: 12px 14px;
       margin-bottom: 14px;
@@ -3709,33 +3856,33 @@
     }
     .mog-dash-toolbar-section {
       display: flex; align-items: center; gap: 8px;
-      font-size: 11.5px; color: #aaa;
+      font-size: 11.5px; color: var(--mog-text-dim);
     }
-    .mog-dash-toolbar-section strong { color: #fafafa; font-weight: 600; }
+    .mog-dash-toolbar-section strong { color: var(--mog-text); font-weight: 600; }
     .mog-dash-toolbar-spacer { flex: 1; }
     .mog-dash-toolbar input[type="number"] {
       width: 80px;
-      background: #0e0f0f; border: 1px solid #2a2b2b;
-      border-radius: 5px; padding: 6px 8px; color: #fafafa;
+      background: var(--mog-bg-deep); border: 1px solid var(--mog-border);
+      border-radius: 5px; padding: 6px 8px; color: var(--mog-text);
       font-size: 11.5px; text-align: center; outline: none;
     }
     .mog-dash-toolbar input[type="number"]:focus { border-color: ${COLOR_ACCENT}; }
     .mog-dash-toggle {
       width: 34px; height: 18px; border-radius: 999px;
-      background: #2a2b2b; cursor: pointer; position: relative;
+      background: var(--mog-border); cursor: pointer; position: relative;
       transition: background 0.15s; flex-shrink: 0;
     }
     .mog-dash-toggle::after {
       content: ''; position: absolute; top: 2px; left: 2px;
-      width: 14px; height: 14px; border-radius: 50%; background: #888;
+      width: 14px; height: 14px; border-radius: 50%; background: var(--mog-text-mute);
       transition: all 0.15s;
     }
     .mog-dash-toggle.mog-dash-toggle-on { background: ${COLOR_ACCENT}; }
     .mog-dash-toggle.mog-dash-toggle-on::after { left: 18px; background: #fff; }
 
     .mog-dash-table {
-      background: #141515;
-      border: 1px solid #232424;
+      background: var(--mog-bg-deep);
+      border: 1px solid var(--mog-border-soft);
       border-radius: 10px;
       overflow: hidden;
       margin-bottom: 14px;
@@ -3749,9 +3896,9 @@
     }
     .mog-dash-thead {
       font-size: 9.5px; font-weight: 700; text-transform: uppercase;
-      letter-spacing: 0.5px; color: #6b6b6b;
-      background: #181919;
-      border-bottom: 1px solid #232424;
+      letter-spacing: 0.5px; color: var(--mog-text-mute);
+      background: var(--mog-surface-2);
+      border-bottom: 1px solid var(--mog-border-soft);
     }
     .mog-dash-thead > div { text-align: center; }
     .mog-dash-thead > div:nth-child(5) { text-align: left; }
@@ -3773,11 +3920,11 @@
       letter-spacing: 0.4px; padding: 3px 6px; border-radius: 4px;
       text-align: center;
     }
-    .mog-dash-type-attack { background: #3a1614; color: #ff8a7a; }
-    .mog-dash-type-support { background: #1d3a23; color: #4ade80; }
-    .mog-dash-row { border-top: 1px solid #1f1f1f; }
+    .mog-dash-type-attack { background: var(--mog-error-soft); color: var(--mog-error); }
+    .mog-dash-type-support { background: var(--mog-success-soft); color: var(--mog-success); }
+    .mog-dash-row { border-top: 1px solid var(--mog-border-soft); }
     .mog-dash-row:first-child { border-top: none; }
-    .mog-dash-row:hover { background: #181919; }
+    .mog-dash-row:hover { background: var(--mog-surface-2); }
     .mog-dash-row > div { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .mog-dash-row .mog-dash-units { white-space: normal; line-height: 1.4; font-size: 10.5px; }
     .mog-dash-row .mog-dash-units img {
@@ -3791,16 +3938,16 @@
     }
     .mog-dash-row .mog-dash-when {
       font-family: 'JetBrains Mono', 'Consolas', monospace;
-      font-size: 10.5px; color: #ccc; text-align: center;
+      font-size: 10.5px; color: var(--mog-text-dim); text-align: center;
     }
     .mog-dash-row .mog-dash-countdown {
       font-family: 'JetBrains Mono', 'Consolas', monospace;
       font-weight: 700; text-align: center;
-      color: #4ade80; font-size: 12px;
+      color: var(--mog-success); font-size: 12px;
       font-variant-numeric: tabular-nums;
     }
     .mog-dash-row .mog-dash-countdown.mog-dash-soon { color: ${COLOR_ACCENT}; }
-    .mog-dash-row .mog-dash-countdown.mog-dash-overdue { color: #888; }
+    .mog-dash-row .mog-dash-countdown.mog-dash-overdue { color: var(--mog-text-mute); }
     .mog-dash-row.mog-dash-row-sent { opacity: 0.5; }
     .mog-dash-row.mog-dash-row-failed { background: rgba(255, 138, 122, 0.06); }
 
@@ -3809,34 +3956,34 @@
       letter-spacing: 0.4px; padding: 3px 6px; border-radius: 4px;
       text-align: center;
     }
-    .mog-dash-st-scheduled { background: #1d2a3a; color: #6cb3ff; }
-    .mog-dash-st-confirming { background: #3a3014; color: #fbbf24; }
-    .mog-dash-st-sending { background: ${COLOR_ACCENT}; color: #fff; }
-    .mog-dash-st-sent { background: #1d3a23; color: #4ade80; }
-    .mog-dash-st-failed { background: #3a1614; color: #ff8a7a; }
-    .mog-dash-st-aborted { background: #2a2b2b; color: #888; }
+    .mog-dash-st-scheduled { background: var(--mog-info-soft); color: var(--mog-info); }
+    .mog-dash-st-confirming { background: var(--mog-warn-soft); color: var(--mog-warn); }
+    .mog-dash-st-sending { background: ${COLOR_ACCENT}; color: var(--mog-bg); }
+    .mog-dash-st-sent { background: var(--mog-success-soft); color: var(--mog-success); }
+    .mog-dash-st-failed { background: var(--mog-error-soft); color: var(--mog-error); }
+    .mog-dash-st-aborted { background: var(--mog-border); color: var(--mog-text-mute); }
 
     .mog-dash-empty {
-      text-align: center; color: #6b6b6b; padding: 40px 16px;
+      text-align: center; color: var(--mog-text-mute); padding: 40px 16px;
       font-size: 12px; font-style: italic;
-      background: #181919;
-      border: 1px dashed #2a2b2b;
+      background: var(--mog-surface-2);
+      border: 1px dashed var(--mog-border);
       border-radius: 10px;
     }
 
     .mog-dash-history-toggle {
-      background: transparent; border: 1px solid #2a2b2b;
-      color: #aaa; padding: 8px 14px; border-radius: 7px;
+      background: transparent; border: 1px solid var(--mog-border);
+      color: var(--mog-text-dim); padding: 8px 14px; border-radius: 7px;
       font-size: 11px; cursor: pointer; font-weight: 600;
       letter-spacing: 0.3px; width: 100%; text-align: center;
       margin-bottom: 14px;
     }
-    .mog-dash-history-toggle:hover { color: #fafafa; border-color: #3a3b3b; }
+    .mog-dash-history-toggle:hover { color: var(--mog-text); border-color: var(--mog-border); }
 
     .mog-lot-unit {
       min-width: 0;
-      background: #141515;
-      border: 1px solid #232424;
+      background: var(--mog-bg-deep);
+      border: 1px solid var(--mog-border-soft);
       border-radius: 6px;
       padding: 5px 3px;
       display: flex;
@@ -3857,17 +4004,17 @@
     }
     .mog-lot-unit img { width: 18px; height: 18px; image-rendering: pixelated; }
     .mog-lot-unit-name {
-      font-size: 9.5px; color: #ccc; font-weight: 600;
+      font-size: 9.5px; color: var(--mog-text-dim); font-weight: 600;
       text-align: center; line-height: 1.15;
       min-height: 22px;
       display: flex; align-items: center; justify-content: center;
       letter-spacing: -0.2px;
     }
-    .mog-lot-unit-off .mog-lot-unit-name { color: #666; }
+    .mog-lot-unit-off .mog-lot-unit-name { color: var(--mog-text-mute); }
     .mog-lot-unit select, .mog-lot-unit input {
       width: 100%; box-sizing: border-box;
-      background: #0e0f0f; border: 1px solid #2a2b2b;
-      border-radius: 4px; padding: 4px 2px; color: #e6e6e6;
+      background: var(--mog-bg-deep); border: 1px solid var(--mog-border);
+      border-radius: 4px; padding: 4px 2px; color: var(--mog-text);
       font-size: 10px; outline: none; min-width: 0;
       text-align: center;
     }
@@ -3884,7 +4031,7 @@
 
     .mog-lot-add {
       background: transparent;
-      border: 1px dashed #3a3b3b;
+      border: 1px dashed var(--mog-border);
       color: ${COLOR_ACCENT};
       padding: 10px 16px;
       border-radius: 8px;
@@ -3897,8 +4044,8 @@
 
     /* log dock */
     .mog-log {
-      border-top: 1px solid #1f1f1f;
-      background: #0e0f0f;
+      border-top: 1px solid var(--mog-border-soft);
+      background: var(--mog-bg-deep);
       display: flex; flex-direction: column;
       max-height: 180px;
       transition: max-height 0.2s ease;
@@ -3908,38 +4055,38 @@
     .mog-log-head {
       display: flex; align-items: center; gap: 10px;
       padding: 8px 18px;
-      border-bottom: 1px solid #1f1f1f;
+      border-bottom: 1px solid var(--mog-border-soft);
       flex-shrink: 0;
     }
     .mog-log.mog-log-collapsed .mog-log-head { border-bottom: none; }
     .mog-log-title {
       font-size: 10px; font-weight: 700; text-transform: uppercase;
-      letter-spacing: 0.6px; color: #888;
+      letter-spacing: 0.6px; color: var(--mog-text-mute);
     }
     .mog-log-count {
-      font-size: 10px; color: #5a5b5b; font-weight: 600;
+      font-size: 10px; color: var(--mog-text-mute); font-weight: 600;
     }
     .mog-log-spacer { flex: 1; }
     .mog-log-action {
       background: transparent; border: none;
-      color: #888; cursor: pointer;
+      color: var(--mog-text-mute); cursor: pointer;
       padding: 4px 10px; font-size: 10.5px; font-weight: 600;
       border-radius: 5px; letter-spacing: 0.3px;
       text-transform: uppercase; transition: all 0.15s;
     }
-    .mog-log-action:hover { color: #fafafa; background: #1a1b1b; }
+    .mog-log-action:hover { color: var(--mog-text); background: var(--mog-surface-2); }
 
     .mog-log-body {
       flex: 1; overflow-y: auto;
       padding: 8px 18px;
       font-family: 'JetBrains Mono', 'Consolas', monospace;
-      font-size: 10.5px; color: #aaa; line-height: 1.6;
+      font-size: 10.5px; color: var(--mog-text-dim); line-height: 1.6;
     }
     .mog-log-body::-webkit-scrollbar { width: 6px; }
-    .mog-log-body::-webkit-scrollbar-thumb { background: #2a2b2b; border-radius: 3px; }
+    .mog-log-body::-webkit-scrollbar-thumb { background: var(--mog-border); border-radius: 3px; }
     .mog-log.mog-log-collapsed .mog-log-body { display: none; }
     .mog-log-body:empty::before {
-      content: 'Sem atividade ainda.'; color: #555; font-style: italic;
+      content: 'Sem atividade ainda.'; color: var(--mog-text-mute); font-style: italic;
     }
     .mog-log-body div { padding: 1px 0; }
 
@@ -3949,20 +4096,20 @@
       margin-bottom: 10px;
     }
     .mog-farm-head h2 {
-      margin: 0; font-size: 14px; font-weight: 700; color: #fafafa;
+      margin: 0; font-size: 14px; font-weight: 700; color: var(--mog-text);
       letter-spacing: 0.2px;
     }
     .mog-farm-toggle-wrap {
       display: flex; align-items: center; gap: 10px;
     }
     .mog-farm-next {
-      font-size: 10.5px; color: #888; letter-spacing: 0.1px;
+      font-size: 10.5px; color: var(--mog-text-mute); letter-spacing: 0.1px;
     }
-    .mog-farm-next strong { color: #e6e6e6; font-weight: 700; }
+    .mog-farm-next strong { color: var(--mog-text); font-weight: 700; }
 
     .mog-farm-block {
-      background: #181919;
-      border: 1px solid #232424;
+      background: var(--mog-surface-2);
+      border: 1px solid var(--mog-border-soft);
       border-radius: 8px;
       padding: 10px 12px;
       margin-bottom: 8px;
@@ -3970,7 +4117,7 @@
     .mog-farm-block-title {
       display: flex; align-items: center; justify-content: space-between;
       gap: 8px;
-      font-size: 10px; font-weight: 700; color: #777;
+      font-size: 10px; font-weight: 700; color: var(--mog-text-mute);
       text-transform: uppercase; letter-spacing: 0.5px;
       margin-bottom: 8px;
     }
@@ -3985,7 +4132,7 @@
       min-width: 0;
     }
     .mog-farm-config-row label {
-      font-size: 11px; color: #aaa; font-weight: 500;
+      font-size: 11px; color: var(--mog-text-dim); font-weight: 500;
       flex: 0 0 auto;
       white-space: nowrap;
     }
@@ -3998,13 +4145,13 @@
       padding: 5px 4px; font-size: 11px;
     }
     .mog-farm-suffix {
-      font-size: 10.5px; color: #777; letter-spacing: 0.1px;
+      font-size: 10.5px; color: var(--mog-text-mute); letter-spacing: 0.1px;
       flex: 0 0 auto;
     }
     .mog-farm-safemode {
       grid-column: 1 / -1;
       padding: 4px 0;
-      border-top: 1px solid #232424;
+      border-top: 1px solid var(--mog-border-soft);
       margin-top: 2px;
     }
     .mog-farm-safemode .mog-toggle {
@@ -4013,8 +4160,8 @@
     }
 
     .mog-farm-tpl {
-      background: #141515;
-      border: 1px solid #2a2b2b;
+      background: var(--mog-bg-deep);
+      border: 1px solid var(--mog-border);
       border-radius: 6px;
       padding: 8px 10px;
       margin-bottom: 6px;
@@ -4024,7 +4171,7 @@
       margin-bottom: 8px;
     }
     .mog-farm-tpl-letter {
-      background: ${COLOR_ACCENT}; color: #fff;
+      background: ${COLOR_ACCENT}; color: var(--mog-bg);
       padding: 2px 8px; border-radius: 4px;
       font-size: 10px; font-weight: 700;
       letter-spacing: 0.4px; text-transform: uppercase;
@@ -4047,9 +4194,9 @@
     }
     .mog-farm-u input {
       width: 100%; box-sizing: border-box;
-      background: #0e0f0f; border: 1px solid #2a2b2b;
+      background: var(--mog-bg-deep); border: 1px solid var(--mog-border);
       border-radius: 4px; padding: 3px 2px;
-      color: #e6e6e6; font-size: 10.5px;
+      color: var(--mog-text); font-size: 10.5px;
       outline: none; text-align: center;
       font-variant-numeric: tabular-nums;
       -moz-appearance: textfield;
@@ -4063,16 +4210,16 @@
     .mog-farm-tpl-loading,
     .mog-farm-tpl-error {
       padding: 10px; text-align: center;
-      font-size: 11px; color: #888; font-style: italic;
-      background: #141515; border: 1px dashed #2a2b2b;
+      font-size: 11px; color: var(--mog-text-mute); font-style: italic;
+      background: var(--mog-bg-deep); border: 1px dashed var(--mog-border);
       border-radius: 6px;
     }
-    .mog-farm-tpl-error { color: #e87b65; font-style: normal; }
+    .mog-farm-tpl-error { color: var(--mog-error); font-style: normal; }
 
     .mog-farm-btn-primary {
-      background: ${COLOR_ACCENT}; color: #fff; border: none;
-      padding: 7px 14px; border-radius: 5px;
-      font-size: 11px; font-weight: 700; cursor: pointer;
+      background: ${COLOR_ACCENT}; color: var(--mog-bg); border: none;
+      padding: 9px 16px; border-radius: 5px;
+      font-size: 13px; font-weight: 700; cursor: pointer;
       letter-spacing: 0.3px; text-transform: uppercase;
       transition: filter 0.15s;
       width: 100%;
@@ -4082,26 +4229,26 @@
 
     .mog-farm-btn-ghost {
       background: transparent;
-      border: 1px solid #2a2b2b;
-      color: #aaa;
-      padding: 4px 10px; border-radius: 5px;
-      font-size: 10px; font-weight: 600; cursor: pointer;
+      border: 1px solid var(--mog-border);
+      color: var(--mog-text-dim);
+      padding: 6px 12px; border-radius: 5px;
+      font-size: 12px; font-weight: 600; cursor: pointer;
       letter-spacing: 0.3px;
       transition: all 0.15s;
     }
-    .mog-farm-btn-ghost:hover { color: #fafafa; border-color: ${COLOR_ACCENT}; }
+    .mog-farm-btn-ghost:hover { color: var(--mog-text); border-color: ${COLOR_ACCENT}; }
 
     .mog-farm-btn-secondary {
-      background: #1f2020; color: #e6e6e6;
-      border: 1px solid #2a2b2b;
-      padding: 6px 12px; border-radius: 5px;
-      font-size: 10.5px; font-weight: 600; cursor: pointer;
+      background: var(--mog-surface-hover); color: var(--mog-text);
+      border: 1px solid var(--mog-border);
+      padding: 8px 14px; border-radius: 5px;
+      font-size: 12px; font-weight: 600; cursor: pointer;
       letter-spacing: 0.3px;
       transition: all 0.15s;
       width: 100%;
     }
     .mog-farm-btn-secondary:hover:not(:disabled) {
-      border-color: ${COLOR_ACCENT}; color: #fff;
+      border-color: ${COLOR_ACCENT}; color: var(--mog-text);
     }
     .mog-farm-btn-secondary:disabled { opacity: 0.5; cursor: not-allowed; }
 
@@ -4115,8 +4262,8 @@
     }
     .mog-farm-progress-bar {
       flex: 1; height: 6px;
-      background: #1f2020;
-      border: 1px solid #2a2b2b;
+      background: var(--mog-surface-hover);
+      border: 1px solid var(--mog-border);
       border-radius: 3px;
       overflow: hidden;
     }
@@ -4126,7 +4273,7 @@
       transition: width 0.25s ease-out;
     }
     .mog-farm-progress-text {
-      font-size: 10.5px; color: #cfcfcf;
+      font-size: 10.5px; color: var(--mog-text-dim);
       font-family: 'JetBrains Mono', 'Consolas', monospace;
       letter-spacing: 0.2px;
       flex: 0 0 auto;
@@ -4139,21 +4286,21 @@
       display: flex; flex-direction: column; gap: 4px;
     }
     .mog-farm-wb-row {
-      font-size: 11px; color: #cfcfcf;
+      font-size: 11px; color: var(--mog-text-dim);
       padding: 5px 10px;
-      background: #141515; border: 1px solid #2a2b2b;
+      background: var(--mog-bg-deep); border: 1px solid var(--mog-border);
       border-radius: 5px;
     }
     .mog-farm-wb-meta {
-      font-size: 10px; color: #6b6b6b; margin-left: 6px;
+      font-size: 10px; color: var(--mog-text-mute); margin-left: 6px;
     }
 
     .mog-farm-empty {
       padding: 24px;
       text-align: center;
-      font-size: 12px; color: #888; font-style: italic;
-      background: #181919;
-      border: 1px solid #232424;
+      font-size: 12px; color: var(--mog-text-mute); font-style: italic;
+      background: var(--mog-surface-2);
+      border: 1px solid var(--mog-border-soft);
       border-radius: 8px;
       margin-bottom: 8px;
     }
@@ -4162,7 +4309,7 @@
     .mog-def-legend {
       display: flex; flex-wrap: wrap; gap: 14px;
       align-items: center;
-      font-size: 11px; color: #aaa;
+      font-size: 11px; color: var(--mog-text-dim);
     }
     .mog-def-legend .mog-def-icon {
       display: inline-block; margin-right: 4px;
@@ -4170,7 +4317,7 @@
     }
     .mog-def-legend-meta {
       flex: 1 1 100%;
-      font-size: 10.5px; color: #6b6b6b; font-style: italic;
+      font-size: 10.5px; color: var(--mog-text-mute); font-style: italic;
       margin-top: 4px;
     }
 
@@ -4185,8 +4332,8 @@
       gap: 8px;
       align-items: center;
       padding: 6px 10px;
-      background: #141515;
-      border: 1px solid #2a2b2b;
+      background: var(--mog-bg-deep);
+      border: 1px solid var(--mog-border);
       border-radius: 5px;
       font-size: 11px;
     }
@@ -4194,7 +4341,7 @@
       background: transparent;
       border: none;
       padding: 4px 10px;
-      font-size: 10px; color: #6b6b6b;
+      font-size: 10px; color: var(--mog-text-mute);
       text-transform: uppercase;
       letter-spacing: 0.4px;
       font-weight: 700;
@@ -4216,14 +4363,14 @@
       font-variant-numeric: tabular-nums;
     }
     .mog-def-empty {
-      color: #555; font-style: italic; font-size: 10.5px;
+      color: var(--mog-text-mute); font-style: italic; font-size: 10.5px;
     }
     .mog-def-units {
       display: flex; flex-wrap: wrap; gap: 4px 8px;
     }
     .mog-def-unit {
       display: inline-flex; align-items: center; gap: 3px;
-      font-size: 10.5px; color: #cfcfcf;
+      font-size: 10.5px; color: var(--mog-text-dim);
       font-variant-numeric: tabular-nums;
     }
     .mog-def-unit img {
@@ -4231,7 +4378,7 @@
       image-rendering: pixelated;
     }
     .mog-def-time {
-      font-size: 10px; color: #888;
+      font-size: 10px; color: var(--mog-text-mute);
       text-align: center;
       font-variant-numeric: tabular-nums;
     }
@@ -4242,10 +4389,16 @@
   `);
 
   // ---- DOM build ----
+  function anyModuleActive() {
+    if (Array.isArray(state.recruiter?.profiles) && state.recruiter.profiles.some(p => p.enabled)) return true;
+    if (state.farmer?.enabled) return true;
+    if (state.builder?.enabled && Array.isArray(state.builder.profiles) && state.builder.profiles.some(p => p.enabled)) return true;
+    return false;
+  }
   const launcher = document.createElement('div');
-  launcher.className = 'mog-launcher' + (state.enabled ? ' mog-active' : '');
+  launcher.className = 'mog-launcher' + (anyModuleActive() ? ' mog-active' : '');
   launcher.innerHTML = `M<div class="mog-launcher-dot"></div>`;
-  launcher.title = 'Mog Scripts';
+  launcher.title = 'Millennium';
 
   const overlay = document.createElement('div');
   overlay.className = 'mog-overlay';
@@ -4256,11 +4409,17 @@
     <div class="mog-head">
       <div class="mog-logo">M</div>
       <div>
-        <div class="mog-title-name">Mog Scripts</div>
+        <div class="mog-title-name">Millennium</div>
         <div class="mog-title-ver">v${VERSION}</div>
       </div>
       <div class="mog-head-spacer"></div>
-      <button class="mog-toggle" id="mog-toggle">Pausado</button>
+      <div class="mog-head-chips">
+        <span class="mog-chip mog-chip-captcha" id="mog-chip-captcha" title="Captcha detectado — clique para reativar" hidden>
+          <span class="mog-chip-dot"></span>Captcha
+        </span>
+        <span class="mog-chip mog-chip-rtt" id="mog-chip-rtt" title="Latência média ao servidor" hidden>RTT —</span>
+        <span class="mog-chip mog-chip-clock" id="mog-chip-clock" title="Hora do servidor" hidden>--:--:--</span>
+      </div>
       <button class="mog-close" id="mog-close">&times;</button>
     </div>
 
@@ -4280,11 +4439,6 @@
             <span class="mog-side-icon">⚔</span>
             <span>Recrutamento</span>
             <span class="mog-side-status" data-status-for="recruiter"></span>
-          </div>
-          <div class="mog-side-item mog-side-disabled" data-section="research">
-            <span class="mog-side-icon">⚗</span>
-            <span>Pesquisa</span>
-            <span class="mog-side-badge">Em breve</span>
           </div>
         </div>
       </div>
@@ -4326,19 +4480,6 @@
         </div>
       </div>
 
-      <div class="mog-side-section" data-side-section="tools">
-        <div class="mog-side-title" data-side-toggle="tools">
-          <span class="mog-side-caret">▼</span>
-          <span>Ferramentas</span>
-        </div>
-        <div class="mog-side-items">
-          <div class="mog-side-item mog-side-disabled">
-            <span class="mog-side-icon">⚙</span>
-            <span>Configurações</span>
-            <span class="mog-side-badge">Em breve</span>
-          </div>
-        </div>
-      </div>
     </aside>
 
     <div class="mog-main">
@@ -4380,26 +4521,51 @@
 
   if (state.ui.panelOpen) openPanel();
 
-  // ---- global toggle ----
-  const toggleBtn = panel.querySelector('#mog-toggle');
-  function syncToggle() {
-    if (state.enabled) {
-      toggleBtn.classList.add('mog-on');
-      toggleBtn.textContent = 'Ativo';
-      launcher.classList.add('mog-active');
-    } else {
-      toggleBtn.classList.remove('mog-on');
-      toggleBtn.textContent = 'Pausado';
-      launcher.classList.remove('mog-active');
-    }
-  }
-  toggleBtn.addEventListener('click', () => {
-    if (state.enabled) stopGlobal();
-    else startGlobal();
-    syncToggle();
-    renderContent();
+  // ---- header chips (read-only: latência, hora servidor, captcha) ----
+  const chipCaptcha = panel.querySelector('#mog-chip-captcha');
+  const chipRtt = panel.querySelector('#mog-chip-rtt');
+  const chipClock = panel.querySelector('#mog-chip-clock');
+
+  chipCaptcha.addEventListener('click', () => {
+    resumeFromCaptcha();
+    updateHeadChips();
   });
-  syncToggle();
+
+  function updateHeadChips() {
+    // Captcha — só visível em trip; clique reativa
+    const tripped = state.captchaTrippedAt > 0;
+    chipCaptcha.hidden = !tripped;
+
+    // RTT — cor por threshold
+    const rtt = state.scheduler?.latency?.avgRtt;
+    if (Number.isFinite(rtt) && rtt > 0) {
+      chipRtt.textContent = `RTT ${Math.round(rtt)}ms`;
+      chipRtt.classList.remove('mog-chip-warn', 'mog-chip-error', 'mog-chip-ok');
+      if (rtt < 100) chipRtt.classList.add('mog-chip-ok');
+      else if (rtt < 300) chipRtt.classList.add('mog-chip-warn');
+      else chipRtt.classList.add('mog-chip-error');
+    } else {
+      chipRtt.textContent = 'RTT —';
+      chipRtt.classList.remove('mog-chip-warn', 'mog-chip-error', 'mog-chip-ok');
+    }
+
+    // Server clock — hh:mm:ss do servidor TW
+    try {
+      const t = serverNow();
+      const d = new Date(t);
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      const ss = String(d.getSeconds()).padStart(2, '0');
+      chipClock.textContent = `${hh}:${mm}:${ss}`;
+    } catch {
+      chipClock.textContent = '--:--:--';
+    }
+
+    // Launcher dot reflete "tem algum módulo ativo"
+    launcher.classList.toggle('mog-active', anyModuleActive());
+  }
+  updateHeadChips();
+  setInterval(updateHeadChips, 1000);
 
   // ---- sidebar nav ----
   panel.querySelectorAll('.mog-side-item[data-section]').forEach(item => {
@@ -4486,7 +4652,7 @@
   //   - scheduler/dashboard: ao menos 1 comando agendado/confirmando ainda pra ser enviado
   //   - farmer: state.farmer.enabled
   function refreshSidebarStatus() {
-    const recruiterOn = state.enabled && state.recruiter.profiles.some(p => p.enabled);
+    const recruiterOn = state.recruiter.profiles.some(p => p.enabled);
     const farmerOn = !!state.farmer.enabled;
     const builderOn = !!state.builder?.enabled && (state.builder.profiles || []).some(p => p.enabled);
     const hasScheduledCmd = state.scheduler.operations.some(op =>
@@ -4614,17 +4780,42 @@
 
   // ---- passo 1: alvos ----
   function renderWizardStep1(op) {
+    if (!op.defaultArrival) op.defaultArrival = { datetime: 0, ms: 0 };
     const body = content.querySelector('#mog-wiz-body');
+    const arrivalStr = fmtDateForInput(op.defaultArrival.datetime);
     body.innerHTML = `
       <div class="mog-wiz-section">
         <div class="mog-wiz-section-title">
-          <span>1. Coordenadas dos alvos</span>
-          <span style="color:#6b6b6b;font-weight:400;text-transform:none;letter-spacing:0;">${op.targets.length} cadastrado(s)</span>
+          <span>1. Padrão de chegada</span>
+        </div>
+        <div class="mog-wiz-default-arrival">
+          <div class="mog-wiz-fld" style="flex:2;">
+            <label>Data e hora</label>
+            <input type="text" id="mog-wiz-default-dt"
+              placeholder="DD/MM/YYYY HH:MM:SS"
+              autocomplete="off"
+              spellcheck="false"
+              value="${escapeHtml(arrivalStr)}">
+          </div>
+          <div class="mog-wiz-fld" style="flex:1;">
+            <label>MS padrão</label>
+            <input type="number" min="0" max="999" id="mog-wiz-default-ms" value="${op.defaultArrival.ms || 0}">
+          </div>
+        </div>
+        <div class="mog-wiz-hint" style="margin-top:8px;">
+          Formato: <strong>DD/MM/YYYY HH:MM:SS</strong> (sempre, independente do sistema). Esse horário é aplicado a todos os alvos extraídos. Você pode editar o MS de cada alvo individualmente depois.
+        </div>
+      </div>
+
+      <div class="mog-wiz-section">
+        <div class="mog-wiz-section-title">
+          <span>2. Coordenadas dos alvos</span>
+          <span style="color:var(--mog-text-mute);font-weight:400;text-transform:none;letter-spacing:0;">${op.targets.length} cadastrado(s)</span>
         </div>
         <textarea class="mog-wiz-textarea" id="mog-wiz-coords-input"
           placeholder="Cole qualquer texto. Coordenadas no formato 123|456 serão extraídas automaticamente.&#10;Exemplo: 100% de aproveitamento (401|464) K44"></textarea>
         <div class="mog-wiz-row">
-          <label style="font-size:11px;color:#aaa;display:flex;align-items:center;gap:6px;cursor:pointer;flex:1;">
+          <label style="font-size:11px;color:var(--mog-text-dim);display:flex;align-items:center;gap:6px;cursor:pointer;flex:1;">
             <input type="checkbox" id="mog-wiz-dedup" checked> Remover coordenadas duplicadas
           </label>
           <button class="mog-btn mog-btn-ghost" id="mog-wiz-extract" style="width:auto;">Extrair coordenadas</button>
@@ -4633,7 +4824,7 @@
 
       <div class="mog-wiz-section">
         <div class="mog-wiz-section-title">
-          <span>2. Configuração por alvo</span>
+          <span>3. Alvos cadastrados</span>
           ${op.targets.length ? '<button class="mog-log-action" id="mog-wiz-clear-targets">Limpar tudo</button>' : ''}
         </div>
         ${op.targets.length === 0 ? `
@@ -4642,8 +4833,7 @@
           <div class="mog-tg-head">
             <div>Coordenadas</div>
             <div>Chegada</div>
-            <div>Random?</div>
-            <div>Até (se random)</div>
+            <div>MS</div>
             <div>Ataques</div>
             <div>Apoios</div>
             <div>Nobres</div>
@@ -4660,6 +4850,33 @@
       </div>
     `;
 
+    const dtInp = body.querySelector('#mog-wiz-default-dt');
+    dtInp.addEventListener('change', e => {
+      const raw = e.target.value.trim();
+      if (!raw) {
+        op.defaultArrival.datetime = 0;
+        e.target.classList.remove('mog-input-error');
+      } else {
+        const parsed = parseDateFromInput(raw);
+        if (parsed) {
+          op.defaultArrival.datetime = parsed;
+          e.target.value = fmtDateForInput(parsed);   // re-formata canônico
+          e.target.classList.remove('mog-input-error');
+        } else {
+          e.target.classList.add('mog-input-error');
+          pushSchedulerLog('Formato inválido. Use DD/MM/YYYY HH:MM:SS (ex: 02/05/2026 19:19:00).');
+          return;
+        }
+      }
+      persist();
+    });
+    body.querySelector('#mog-wiz-default-ms').addEventListener('change', e => {
+      const v = Math.max(0, Math.min(999, parseInt(e.target.value, 10) || 0));
+      op.defaultArrival.ms = v;
+      e.target.value = v;
+      persist();
+    });
+
     body.querySelector('#mog-wiz-extract').addEventListener('click', () => {
       const txt = body.querySelector('#mog-wiz-coords-input').value;
       const dedup = body.querySelector('#mog-wiz-dedup').checked;
@@ -4668,12 +4885,17 @@
         pushSchedulerLog('Nenhuma coordenada válida encontrada no texto colado.');
         return;
       }
+      if (!op.defaultArrival.datetime) {
+        pushSchedulerLog('Defina a data e hora de chegada padrão antes de extrair coordenadas.');
+        return;
+      }
+      const baseArrivalAt = (Math.floor(op.defaultArrival.datetime / 1000) * 1000) + (op.defaultArrival.ms || 0);
       const existing = new Set(op.targets.map(t => t.coords));
       const added = [];
       let skippedDup = 0;
       for (const f of found) {
         if (dedup && existing.has(f.coords)) { skippedDup++; continue; }
-        op.targets.push(makeTarget({ coords: f.coords, x: f.x, y: f.y }));
+        op.targets.push(makeTarget({ coords: f.coords, x: f.x, y: f.y, arrivalAt: baseArrivalAt }));
         existing.add(f.coords);
         added.push(f.coords);
       }
@@ -4721,19 +4943,13 @@
   }
 
   function renderTargetRow(t) {
-    // arrivalAt está em tempo de servidor — exibimos direto (datetime-local interpreta como local,
-    // mas tratamos a "hora do servidor" como se fosse a do PC pra UI; só o setTimeout converte).
-    const arrival = t.arrivalAt ? toDatetimeLocalString(t.arrivalAt) : '';
-    const arrivalTo = t.arrivalRandom?.toAt ? toDatetimeLocalString(t.arrivalRandom.toAt) : '';
-    const isRandom = !!t.arrivalRandom;
+    const arrival = t.arrivalAt ? fmtFullDate(Math.floor(t.arrivalAt / 1000) * 1000) : '—';
+    const targetMs = t.arrivalAt ? (t.arrivalAt % 1000) : 0;
     return `
       <div class="mog-tg-row" data-tid="${t.id}">
         <div class="mog-tg-coords">${escapeHtml(t.coords)}</div>
-        <input type="datetime-local" data-tact="arrival" data-tid="${t.id}" value="${arrival}" ${isRandom ? 'disabled style="opacity:0.4;"' : ''}>
-        <div style="text-align:center;">
-          <input type="checkbox" data-tact="random" data-tid="${t.id}" ${isRandom ? 'checked' : ''} style="cursor:pointer;">
-        </div>
-        <input type="datetime-local" data-tact="arrival-to" data-tid="${t.id}" value="${arrivalTo}" ${isRandom ? '' : 'disabled style="opacity:0.4;"'}>
+        <div class="mog-tg-arrival">${arrival.replace(/\.\d{3}$/, '')}</div>
+        <input type="number" min="0" max="999" data-tact="ms" data-tid="${t.id}" value="${targetMs}">
         <input type="number" min="0" data-tact="count-attack" data-tid="${t.id}" value="${t.counts.attack}">
         <input type="number" min="0" data-tact="count-support" data-tid="${t.id}" value="${t.counts.support}">
         <input type="number" min="0" data-tact="count-noble" data-tid="${t.id}" value="${t.counts.noble}">
@@ -4746,35 +4962,44 @@
     const t = op.targets.find(x => x.id === e.target.dataset.tid);
     if (!t) return;
     const act = e.target.dataset.tact;
-    if (act === 'arrival') {
-      // O usuário digita pensando no RELÓGIO DO SERVIDOR (que ele vê na tela do TW).
-      // Tratamos o timestamp do datetime-local DIRETAMENTE como tempo de servidor,
-      // sem conversão. A conversão pra tempo local do PC só acontece em setTimeout.
-      t.arrivalAt = e.target.value ? new Date(e.target.value).getTime() : 0;
-    } else if (act === 'arrival-to') {
-      const toMs = e.target.value ? new Date(e.target.value).getTime() : 0;
-      t.arrivalRandom = t.arrivalRandom || { fromAt: t.arrivalAt || 0, toAt: 0 };
-      t.arrivalRandom.toAt = toMs;
-    } else if (act === 'random') {
-      if (e.target.checked) {
-        t.arrivalRandom = { fromAt: t.arrivalAt || 0, toAt: 0 };
-      } else {
-        t.arrivalRandom = null;
-      }
+    if (act === 'ms') {
+      const v = Math.max(0, Math.min(999, parseInt(e.target.value, 10) || 0));
+      const base = Math.floor((t.arrivalAt || 0) / 1000) * 1000;
+      t.arrivalAt = base + v;
+      e.target.value = v;
     } else if (act.startsWith('count-')) {
       const kind = act.replace('count-', '');
       t.counts[kind] = Math.max(0, parseInt(e.target.value, 10) || 0);
     }
     persist();
-    // só re-renderiza se mudou estrutura visual (toggle random)
-    if (act === 'random') renderWizardStep1(op);
   }
 
-  function toDatetimeLocalString(ms) {
+  // "DD/MM/YYYY HH:MM:SS" — formato pra input texto (sem ms).
+  function fmtDateForInput(ms) {
     if (!ms) return '';
     const d = new Date(ms);
     const pad = n => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  // Parseia "DD/MM/YYYY HH:MM[:SS]" → Unix ms. Retorna 0 se inválido.
+  function parseDateFromInput(str) {
+    if (!str) return 0;
+    const m = String(str).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+    if (!m) return 0;
+    const [, dd, mm, yyyy, hh, MM, ss] = m;
+    const d = new Date(parseInt(yyyy, 10), parseInt(mm, 10) - 1, parseInt(dd, 10),
+                       parseInt(hh, 10), parseInt(MM, 10), parseInt(ss || '0', 10), 0);
+    if (isNaN(d.getTime())) return 0;
+    return d.getTime();
+  }
+
+  // "DD/MM/YYYY HH:MM:SS.mmm" — formato canônico de exibição em todo lugar.
+  function fmtFullDate(ms) {
+    if (!ms) return '—';
+    const d = new Date(ms);
+    const pad = n => String(n).padStart(2, '0');
+    return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`;
   }
 
   // ---- passo 2: origens + lotes ----
@@ -4797,7 +5022,7 @@
     const body = content.querySelector('#mog-wiz-body');
 
     body.innerHTML = `
-      <div id="mog-wiz-lot-host"></div>
+      <div class="mog-wiz-section" id="mog-wiz-lot-host"></div>
 
       <div class="mog-wiz-foot">
         <span class="mog-wiz-hint">
@@ -4854,7 +5079,7 @@
                 <label>Ou cole coordenadas das origens</label>
                 <textarea class="mog-wiz-textarea" data-lact="textarea" placeholder="123|456 234|567 ..." style="min-height:60px;">${escapeHtml(sg.rawText)}</textarea>
                 <div class="mog-wiz-row" style="margin-top:6px;">
-                  <label style="font-size:10.5px;color:#aaa;display:flex;align-items:center;gap:5px;cursor:pointer;flex:1;">
+                  <label style="font-size:10.5px;color:var(--mog-text-dim);display:flex;align-items:center;gap:5px;cursor:pointer;flex:1;">
                     <input type="checkbox" data-lact="dedup"> Remover duplicadas
                   </label>
                   <button class="mog-btn mog-btn-ghost" data-lact="extract" style="width:auto;">Extrair</button>
@@ -4876,23 +5101,6 @@
                   <option value="attack" ${m.type === 'attack' ? 'selected' : ''}>Ataque</option>
                   <option value="support" ${m.type === 'support' ? 'selected' : ''}>Apoio</option>
                 </select>
-              </div>
-              <div class="mog-lot-fld">
-                <label style="display:flex;align-items:center;justify-content:space-between;">
-                  <span>MS de chegada</span>
-                  <label style="font-size:10px;color:#aaa;display:flex;align-items:center;gap:5px;cursor:pointer;text-transform:none;letter-spacing:0;font-weight:500;">
-                    <input type="checkbox" data-lact="ms-random" ${m.firstMsRandom ? 'checked' : ''}> Aleatório
-                  </label>
-                </label>
-                ${m.firstMsRandom ? `
-                  <div class="mog-wiz-row" style="margin:0;gap:6px;">
-                    <input type="number" class="mog-input" min="0" max="999" data-lact="ms-min" value="${m.firstMsMin}" placeholder="000" title="MS mínimo">
-                    <span style="color:#6b6b6b;font-size:11px;flex:0;">a</span>
-                    <input type="number" class="mog-input" min="0" max="999" data-lact="ms-max" value="${m.firstMsMax}" placeholder="999" title="MS máximo">
-                  </div>
-                ` : `
-                  <input type="number" class="mog-input" min="0" max="999" data-lact="ms" value="${m.firstMs}" style="text-align:center;">
-                `}
               </div>
               <div class="mog-lot-fld">
                 <label>Alvo da catapulta (se houver)</label>
@@ -5005,32 +5213,6 @@
 
     card.querySelector('[data-lact="type"]').addEventListener('change', e => {
       sg.model.type = e.target.value;
-      persist();
-      renderWizardStep2(op);
-    });
-
-    card.querySelector('[data-lact="ms"]')?.addEventListener('change', e => {
-      sg.model.firstMs = Math.max(0, Math.min(999, parseInt(e.target.value, 10) || 0));
-      e.target.value = sg.model.firstMs;
-      persist();
-    });
-
-    card.querySelector('[data-lact="ms-min"]')?.addEventListener('change', e => {
-      const v = Math.max(0, Math.min(999, parseInt(e.target.value, 10) || 0));
-      sg.model.firstMsMin = Math.min(v, sg.model.firstMsMax);   // garante min <= max
-      e.target.value = sg.model.firstMsMin;
-      persist();
-    });
-
-    card.querySelector('[data-lact="ms-max"]')?.addEventListener('change', e => {
-      const v = Math.max(0, Math.min(999, parseInt(e.target.value, 10) || 0));
-      sg.model.firstMsMax = Math.max(v, sg.model.firstMsMin);   // garante max >= min
-      e.target.value = sg.model.firstMsMax;
-      persist();
-    });
-
-    card.querySelector('[data-lact="ms-random"]').addEventListener('change', e => {
-      sg.model.firstMsRandom = e.target.checked;
       persist();
       renderWizardStep2(op);
     });
@@ -5286,12 +5468,6 @@
     return { units: out, hasAny: Object.keys(out).length > 0 };
   }
 
-  function randomMs(model) {
-    if (!model.firstMsRandom) return model.firstMs;
-    const min = Math.max(0, Math.min(999, model.firstMsMin));
-    const max = Math.max(min, Math.min(999, model.firstMsMax));
-    return Math.floor(min + Math.random() * (max - min + 1));
-  }
 
   // Algoritmo: pra cada slot do alvo (em ordem de cadastro), pega a origem
   // mais próxima do pool ainda não usada. Se nenhum candidato chega a tempo
@@ -5369,7 +5545,8 @@
       let lastReason = '';
       for (const cand of candidates) {
         const m = cand.entry.sg.model;
-        const baseMs = randomMs(m);
+        // ms da chegada vem direto de target.arrivalAt agora; ondas extras = +100ms cada.
+        const baseMs = 0;
         const available = unitsByVillage.get(String(cand.entry.village.villageId)) || unitsByVillage.get(cand.entry.village.villageId) || null;
         // resolve cada wave; se a wave 1 não tem tropa nenhuma, descarta candidato
         const resolvedWaves = [];
@@ -5532,7 +5709,7 @@
               return `<li><strong>${escapeHtml(coords)}</strong> · ${kindLabel} · ${escapeHtml(u.reason)}</li>`;
             }).join('')}
           </ul>
-          <div style="margin-top:6px;font-size:10.5px;color:#ccc;">
+          <div style="margin-top:6px;font-size:10.5px;color:var(--mog-text-dim);">
             Volte ao passo de <strong>Origens</strong> e ajuste tropas (ex: remova Aríetes pra ficar mais rápido) ou cadastre mais aldeias.
           </div>
         </div>
@@ -5545,7 +5722,6 @@
       tableHtml = `
         <div class="mog-cmd-table">
           <div class="mog-cmd-thead">
-            <div></div>
             <div>Origem</div>
             <div>→ Alvo</div>
             <div>Tropas</div>
@@ -5579,8 +5755,7 @@
   function renderCmdRow(c) {
     const now = serverNow();
     const isLate = c.executeAt < now;
-    const stCls = isLate ? 'mog-cmd-st-late' : 'mog-cmd-st-ok';
-    const stLabel = isLate ? 'atraso' : 'ok';
+    const rowCls = isLate ? 'mog-cmd-row mog-cmd-row-late' : 'mog-cmd-row';
 
     const unitsHtml = Object.entries(c.units)
       .filter(([, n]) => n > 0)
@@ -5594,26 +5769,17 @@
       const ss = s % 60;
       return h ? `${h}h ${String(m).padStart(2, '0')}m` : `${m}m ${String(ss).padStart(2, '0')}s`;
     };
-    const fmtDate = serverTs => {
-      if (!serverTs) return '—';
-      // ts está em tempo do servidor; renderizamos como new Date direto pra exibir
-      // exatamente o relógio do servidor (assume mesmo fuso horário cliente/servidor)
-      const d = new Date(serverTs);
-      const pad = n => String(n).padStart(2, '0');
-      return `${pad(d.getDate())}/${pad(d.getMonth() + 1)} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`;
-    };
 
     return `
-      <div class="mog-cmd-row" data-cid="${c.id}">
-        <div><span class="mog-cmd-status ${stCls}">${stLabel}</span></div>
+      <div class="${rowCls}" data-cid="${c.id}">
         <div class="mog-cmd-coords">${escapeHtml(c.sourceCoords)}</div>
         <div class="mog-cmd-coords">${escapeHtml(c.targetCoords)}</div>
         <div class="mog-cmd-units">${unitsHtml}</div>
         <div title="${c.distance.toFixed(2)} campos">${c.distance.toFixed(1)}</div>
         <div title="${fmtDur(c.travelMs)}">${fmtDur(c.travelMs)}</div>
-        <div class="mog-cmd-arr">${fmtDate(c.arrivalAt)}</div>
-        <div><input type="number" min="0" max="999" data-cmd-act="ms" data-cid="${c.id}" value="${c.ms}"></div>
-        <div class="mog-cmd-arr">${fmtDate(c.executeAt)}</div>
+        <div class="mog-cmd-arr">${fmtFullDate(c.arrivalAt)}</div>
+        <div><input type="number" min="0" max="999" data-cmd-act="ms" data-cid="${c.id}" value="${c.arrivalAt % 1000}"></div>
+        <div class="mog-cmd-arr">${fmtFullDate(c.executeAt)}</div>
         <div><button class="mog-iconbtn mog-iconbtn-danger" data-cmd-act="delete" data-cid="${c.id}" title="Remover comando">×</button></div>
       </div>
     `;
@@ -5625,10 +5791,13 @@
     if (!c) return;
     if (e.target.dataset.cmdAct === 'ms') {
       const v = Math.max(0, Math.min(999, parseInt(e.target.value, 10) || 0));
-      // recalcula executeAt mantendo o offset entre comandos da mesma origem (soma do índice)
-      const offsetWithinSource = c.commandIndexInSource * 100;
-      c.ms = v;
-      c.executeAt = c.arrivalAt - c.travelMs + v + offsetWithinSource;
+      // Atualiza o ms da chegada (últimos 3 dígitos de arrivalAt) e recalcula executeAt.
+      // O offset de ondas (100ms por wave dentro do bundle) é mantido como antes.
+      const baseArrival = Math.floor((c.arrivalAt || 0) / 1000) * 1000;
+      c.arrivalAt = baseArrival + v;
+      const waveOffset = (c.commandIndexInSource || 0) * 100;
+      c.ms = waveOffset;
+      c.executeAt = c.arrivalAt - c.travelMs + waveOffset;
       persist();
       renderResultBlock(op);
     }
@@ -5649,12 +5818,7 @@
     const targetSet = new Set(cmds.map(c => c.targetCoords));
     const sourceSet = new Set(cmds.map(c => c.sourceCoords));
 
-    const fmtDate = ts => {
-      if (!ts) return '—';
-      const d = new Date(ts);
-      const pad = n => String(n).padStart(2, '0');
-      return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`;
-    };
+    const fmtDate = fmtFullDate;
     const fmtUntil = ts => {
       if (!ts) return '—';
       const ms = ts - now;
@@ -5673,7 +5837,7 @@
       <div class="mog-wiz-section">
         <div class="mog-wiz-section-title">
           <span>Resumo da operação</span>
-          ${isExecuting ? '<span style="color:#4ade80;font-weight:700;text-transform:none;letter-spacing:0;">● Operação em execução</span>' : ''}
+          ${isExecuting ? '<span style="color:var(--mog-success);font-weight:700;text-transform:none;letter-spacing:0;">● Operação em execução</span>' : ''}
         </div>
 
         <div class="mog-confirm-stats">
@@ -5690,7 +5854,7 @@
             <div class="mog-confirm-stat-label">Aldeias origem</div>
           </div>
           <div class="mog-confirm-stat">
-            <div class="mog-confirm-stat-num" style="${overdue ? 'color:#ff8a7a;' : ''}">${ready}</div>
+            <div class="mog-confirm-stat-num" style="${overdue ? 'color:var(--mog-error);' : ''}">${ready}</div>
             <div class="mog-confirm-stat-label">${overdue ? `Prontos (${overdue} expirados)` : 'Prontos para envio'}</div>
           </div>
         </div>
@@ -5707,8 +5871,8 @@
           </div>
           ${overdue ? `
             <div class="mog-confirm-window-row">
-              <span style="color:#ff8a7a;">Comandos expirados</span>
-              <strong style="color:#ff8a7a;">${overdue}</strong>
+              <span style="color:var(--mog-error);">Comandos expirados</span>
+              <strong style="color:var(--mog-error);">${overdue}</strong>
             </div>
           ` : ''}
         </div>
@@ -5722,14 +5886,6 @@
             </div>
           </div>
         ` : ''}
-
-        <div class="mog-confirm-warn" style="background:#1d2a3a;border-color:#3a82f7;color:#aacaff;">
-          <span class="mog-confirm-warn-icon">ℹ</span>
-          <div>
-            <strong>Mantenha esta aba aberta</strong> e idealmente visível em primeiro plano.
-            Navegadores podem suspender timers em abas em segundo plano, prejudicando a precisão dos milissegundos.
-          </div>
-        </div>
 
         <button class="mog-activate-btn" id="mog-op-activate" ${ready === 0 ? 'disabled' : ''}>
           ${ready === 0 ? 'Nenhum comando válido para enviar' : `Registrar comandos (${ready})`}
@@ -5991,12 +6147,7 @@
   }
 
   function renderDashRow(c, kind) {
-    const fmtDate = serverTs => {
-      if (!serverTs) return '—';
-      const d = new Date(serverTs);
-      const pad = n => String(n).padStart(2, '0');
-      return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`;
-    };
+    const fmtDate = fmtFullDate;
     const unitsHtml = Object.entries(c.units || {})
       .filter(([, n]) => n > 0)
       .map(([uid, n]) => `${n}<img src="/graphic/unit/unit_${uid}.png" alt="${uid}" title="${uid}" onerror="this.style.display='none'">`)
@@ -6089,6 +6240,9 @@
   // Cache em memória dos templates do jogo. Não persiste — sempre relê do am_farm
   // ao abrir a tela. Quando o usuário edita, fica em farmerTemplatesCache até clicar Salvar.
   let farmerTemplatesCache = null;   // { templates: [{id, units, catapultTarget}, ...], csrf, loadedAt }
+  // Flag transitória pra cancelar ciclo ou busca em andamento. Loops checam e fazem
+  // break — não persiste pois é só pra interação imediata. Limpa no início de cada operação.
+  let farmerAbortRequested = false;
 
   function renderFarmer() {
     const f = state.farmer;
@@ -6166,12 +6320,12 @@
 
       <div class="mog-farm-block">
         <div class="mog-farm-actions">
-          <button class="mog-farm-btn-primary" id="mog-farm-run-now" ${f.busy ? 'disabled' : ''}>
-            ${f.busy ? 'Executando...' : 'Executar ciclo'}
-          </button>
-          <button class="mog-farm-btn-secondary" id="mog-farm-search" ${f.busy ? 'disabled' : ''}>
-            Buscar bárbaras
-          </button>
+          ${f.busy ? `
+            <button class="mog-farm-btn-primary" id="mog-farm-stop">Parar</button>
+          ` : `
+            <button class="mog-farm-btn-primary" id="mog-farm-run-now">Executar ciclo</button>
+            <button class="mog-farm-btn-secondary" id="mog-farm-search">Buscar bárbaras</button>
+          `}
         </div>
         <div class="mog-farm-progress" id="mog-farm-progress" style="display: none;">
           <div class="mog-farm-progress-bar"><div class="mog-farm-progress-fill" id="mog-farm-progress-fill"></div></div>
@@ -6328,6 +6482,16 @@
         runFarmerCycle({ manual: true });
       });
     }
+    const stopBtn = root.querySelector('#mog-farm-stop');
+    if (stopBtn) {
+      stopBtn.addEventListener('click', () => {
+        if (!state.farmer.busy) return;
+        farmerAbortRequested = true;
+        stopBtn.disabled = true;
+        stopBtn.textContent = 'Parando...';
+        pushFarmerLog('Cancelamento solicitado pelo usuário.');
+      });
+    }
     const radiusInp = root.querySelector('#mog-farm-radius');
     if (radiusInp) {
       radiusInp.addEventListener('input', e => {
@@ -6444,7 +6608,7 @@
 
   function scheduleFarmerNext() {
     clearTimeout(farmerTimerId);
-    if (!state.farmer.enabled) {
+    if (!state.farmer.enabled || state.captchaTrippedAt > 0) {
       state.farmer.nextRunAt = 0;
       persist();
       refreshFarmerHeader();
@@ -6547,11 +6711,17 @@
       pushFarmerLog('Ciclo ignorado: já há um em execução.');
       return;
     }
+    if (state.captchaTrippedAt > 0) {
+      if (manual) pushFarmerLog('Ciclo bloqueado: captcha ativo. Reative pelo banner.');
+      return;
+    }
     if (!manual && !f.enabled) return;
 
     f.busy = true;
+    farmerAbortRequested = false;
     persist();
     refreshFarmerHeader();
+    renderFarmer();
     pushFarmerLog(manual ? 'Ciclo manual iniciado.' : 'Ciclo iniciado.');
 
     let dispatched = 0;
@@ -6816,6 +6986,7 @@
       // Loop invertido (bárbaras × origens): se origem mais próxima esgotar tropa,
       // tenta a próxima — bárbaras só são abandonadas quando NENHUMA origem serve.
       for (const target of list) {
+        if (farmerAbortRequested) break;
         if (!manual && !state.farmer.enabled) break;
 
         // bárbaras com perdas vão pra wall-break, não dispara
@@ -6837,6 +7008,7 @@
         // tenta preencher cada slot disponível dessa bárbara
         let slots = slotsAvailable(target, sentCount.get(target.villageId) || 0);
         while (slots > 0) {
+          if (farmerAbortRequested) break;
           if (!manual && !state.farmer.enabled) break;
 
           let tplToUse = target.fullLoot ? tplB : tplA;
@@ -6893,13 +7065,16 @@
         }
       }
 
-      pushFarmerLog(`Ciclo finalizado. ${dispatched} farm(s), ${skipped} pulada(s), ${failed} falha(s).`);
+      const prefix = farmerAbortRequested ? 'Ciclo cancelado.' : 'Ciclo finalizado.';
+      pushFarmerLog(`${prefix} ${dispatched} farm(s), ${skipped} pulada(s), ${failed} falha(s).`);
       // mantém a barra cheia por uns segundos pra usuário ver, depois esconde
       setTimeout(() => updateFarmerProgress(0, 0), 5000);
     } finally {
       state.farmer.busy = false;
+      farmerAbortRequested = false;
       persist();
       refreshFarmerHeader();
+      if (state.ui.activeSection === 'farmer') renderFarmer();
       // re-render se a lista de wall-break mudou (pode ter ido de 0 → N entries)
       if (state.ui.activeSection === 'farmer') {
         const wb = state.farmer.needsWallBreak;
@@ -6969,10 +7144,12 @@
       let cursor = 0;
       const exhausted = new Set();
       for (let i = 0; i < limit; i++) {
+        if (farmerAbortRequested) break;
         const t = targets[i];
         if (exhausted.size >= originsWithSpy.length) break;
         let sent = false;
         for (let attempt = 0; attempt < originsWithSpy.length; attempt++) {
+          if (farmerAbortRequested) break;
           const origin = originsWithSpy[(cursor + attempt) % originsWithSpy.length];
           if (exhausted.has(origin.id)) continue;
           try {
@@ -7025,8 +7202,10 @@
       return;
     }
     f.busy = true;
+    farmerAbortRequested = false;
     persist();
     refreshFarmerHeader();
+    renderFarmer();
     pushFarmerLog(`Buscando bárbaras em raio ${f.searchRadius}...`);
 
     try {
@@ -7070,10 +7249,12 @@
       }
 
       const candList = [...candidates.values()];
-      const parts = [];
-      if (skippedOutgoing > 0) parts.push(`${skippedOutgoing} pulada(s) c/ ataque a caminho`);
-      const extra = parts.length ? ` (${parts.join(', ')})` : '';
-      pushFarmerLog(`${candList.length} bárbara(s) pra espionar${extra}.`);
+      const totalNoRaio = candList.length + skippedOutgoing;
+      if (skippedOutgoing > 0) {
+        pushFarmerLog(`${totalNoRaio} candidata(s) no raio: ${candList.length} pra espionar, ${skippedOutgoing} c/ ataque a caminho.`);
+      } else {
+        pushFarmerLog(`${candList.length} bárbara(s) pra espionar.`);
+      }
       if (candList.length === 0) return;
 
       updateFarmerProgress(0, candList.length);
@@ -7092,14 +7273,19 @@
       pushFarmerLog('Falha na busca: ' + e.message);
     } finally {
       state.farmer.busy = false;
+      const wasAborted = farmerAbortRequested;
+      farmerAbortRequested = false;
       persist();
       refreshFarmerHeader();
+      if (state.ui.activeSection === 'farmer') renderFarmer();
+      if (wasAborted) pushFarmerLog('Busca cancelada pelo usuário.');
     }
   }
 
   // Recovery no boot: se enabled estava true antes do reload, re-agenda.
   function recoverFarmerSchedule() {
     if (!state.farmer.enabled) return;
+    if (state.captchaTrippedAt > 0) return;
     // se nextRunAt era no passado (ou perto), agenda novo ciclo daqui a 1min
     // pra não disparar imediatamente após reload da página
     const now = Date.now();
@@ -7376,7 +7562,7 @@
             <span>–</span>
             <input class="mog-input" type="number" min="1" data-act="intmax" value="${p.intervalMax}">
           </div>
-          <div class="mog-status-cell ${p.enabled && state.enabled ? 'mog-status-active' : ''}" data-act="status-cell">
+          <div class="mog-status-cell ${p.enabled ? 'mog-status-active' : ''}" data-act="status-cell">
             ${profileStatusLabel(p)}
           </div>
           <div class="mog-prow-actions">
@@ -7427,7 +7613,7 @@
       return `Executando ${p.running.processed}/${p.running.total}`;
     }
     if (!p.enabled) return 'Pausado';
-    if (!state.enabled) return 'Aguardando';
+    if (state.captchaTrippedAt > 0) return 'Captcha';
     if (p.nextRunAt) {
       const t = new Date(p.nextRunAt);
       return 'Próx. ' + t.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
@@ -7540,7 +7726,7 @@
   function scheduleBuilderProfileNext(profile) {
     const old = builderTimers.get(profile.id);
     if (old) clearTimeout(old);
-    if (!state.builder.enabled || !profile.enabled) {
+    if (!state.builder.enabled || !profile.enabled || state.captchaTrippedAt > 0) {
       profile.nextRunAt = 0;
       builderTimers.delete(profile.id);
       return;
@@ -7593,6 +7779,7 @@
 
   function recoverBuilderSchedule() {
     if (!state.builder.enabled) return;
+    if (state.captchaTrippedAt > 0) return;
     state.builder.profiles.forEach(p => {
       if (p.enabled) scheduleBuilderProfileNext(p);
     });
@@ -7630,6 +7817,10 @@
 
     if (state.builder.busy && !manual) {
       pushBuilderLog(`⚠ "${profile.name}" — ciclo anterior ainda em execução, pulando.`);
+      return;
+    }
+    if (state.captchaTrippedAt > 0) {
+      if (manual) pushBuilderLog(`⚠ "${profile.name}" — captcha ativo. Reative pelo banner.`);
       return;
     }
 
@@ -8153,7 +8344,7 @@
       const cell = content.querySelector(`.mog-prow[data-pid="${p.id}"] [data-act="status-cell"]`);
       if (cell) {
         cell.textContent = profileStatusLabel(p);
-        cell.classList.toggle('mog-status-active', p.enabled && state.enabled);
+        cell.classList.toggle('mog-status-active', p.enabled);
       }
     });
   }, 1000);
@@ -8161,7 +8352,7 @@
   // initial
   renderContent();
   renderLog();
-  if (state.enabled) {
+  if (state.captchaTrippedAt === 0) {
     state.recruiter.profiles.forEach(p => {
       if (p.enabled) scheduleProfileNext(p);
     });

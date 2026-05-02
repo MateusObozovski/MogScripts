@@ -8,8 +8,8 @@ Userscript pessoal de automação para o jogo **Tribal Wars** (br142.tribalwars.
 
 - **Build pipeline (a partir de 0.7.x)**: o **fonte real** vive em `src/Mog.user.js`. `build.js` (Node) ofusca via `javascript-obfuscator` e gera `dist/Mog.user.js` — esse é o arquivo que o Tampermonkey baixa via `@downloadURL`. **Sempre editar `src/`** e rodar `node build.js`. Há ainda `Mog.user.js` na raiz como artefato legado, sincronizado manualmente pelo usuário. Quando precisar editar, prefira `src/` e replicar pra raiz se necessário (script de sync usa `node -e` preservando linhas 10-11 que diferem nas URLs).
 - **Tudo num só arquivo de fonte**: `src/Mog.user.js` é vanilla JS no browser com `// @grant GM_*`. Não introduzir módulos ou dependências runtime — `package.json` só tem `javascript-obfuscator` como devDep.
-- **Só inicializa em `screen=storage`**: o IIFE faz early-return se `unsafeWindow.game_data.screen !== 'storage'`. O usuário gerencia tudo na aba do armazém; ela faz fetches HTTP em background pras outras aldeias. Em qualquer outra tela o script nem carrega o launcher.
-- **Persistência**: `GM_setValue/GM_getValue` com chave `mog_state_v1` (mantida fixa mesmo após mudanças de schema — usar `migrateState` pra acomodar formatos antigos).
+- **Só inicializa em `screen=storage`**: o IIFE faz early-return se `unsafeWindow.game_data.screen !== 'storage'`. O usuário gerencia tudo na aba do armazém; ela faz fetches HTTP em background pras outras aldeias. Em qualquer outra tela o script nem carrega o launcher. **Exceção (a partir de 0.7.1)**: o **captcha guard lite** roda ANTES do early-return em qualquer screen do TW — detecção + banner + logout + canal cross-tab. Só o bot pesado (motores, UI) fica restrito a `screen=storage`.
+- **Persistência**: `GM_setValue/GM_getValue` com chave `mog_state_v1` (mantida fixa mesmo após mudanças de schema — usar `migrateState` pra acomodar formatos antigos). Há também a chave global `mog_captcha_global_v1` (separada, sem migração) usada como fonte de verdade cross-tab pra estado de captcha — escrita pela primeira aba que detecta, lida pelas demais via polling/BroadcastChannel.
 - **Privado, sem servidor**: nada de telemetria, analytics, fetch para domínios externos. Toda comunicação é pra `*.tribalwars.com.br` (mesma origem).
 - **Idioma da UI**: pt-BR. Strings visíveis ao usuário sempre em português.
 - **Versão atual**: ver `@version` no banner do userscript e a constante `VERSION`. Bump em mudança visível ao usuário; manter os dois sincronizados.
@@ -122,6 +122,7 @@ Termos usados no código e nas conversas com o usuário:
     cycleMin: 10,                                    // minutos entre ciclos automáticos
     maxPerBarbarian: 1,                              // ataques simultâneos por bárbara
     searchRadius: 10,                                // raio (campos) pra "Buscar bárbaras"
+    maxFarmRadius: 15,                               // raio máx (campos) origem→bárbara no ciclo. 0 = sem limite
     needsWallBreak: [{ x, y, lastAttempt }],         // bárbaras detectadas com defesa
     log: [],                                         // máx 200
     ui: { collapsed: {} },
@@ -144,6 +145,8 @@ Termos usados no código e nas conversas com o usuário:
 | v3 (0.5.0) | `units[id]` perde `perQueue/maxQueues`; surge `buildings[name]` + `rrCursor` | `migrateProfile` agrupa valores por edifício |
 | v4 (0.6.0) | Adiciona `state.scheduler` com operações, comandos, world config cache, latency, log próprio. State v3 sem scheduler vira default vazio | `migrateState` chama `migrateScheduler(parsed.scheduler)` que cria default se ausente |
 | v5 (0.7.0) | Adiciona `state.farmer` (toggle, config, log, lista de wall-break, busy lock). `ui.activeSection` ganha `'farmer'` e `ui.sideCollapsed` ganha chave `'loot'` | `migrateState` chama `migrateFarmer(parsed.farmer)` que cria default se ausente. `migrateFarmer` zera `busy` no boot pra não travar após reload |
+| 0.7.1 | **Não muda shape do `mog_state_v1`.** Adiciona chave **separada** `mog_captcha_global_v1` (fonte de verdade cross-tab pra captcha — `{trippedAt, reason, sourceTab}`). `state.captchaTrippedAt` continua existindo por compat | Sem migração no `migrateState`. Boot do bot promove flag local antiga pra global se necessário |
+| v6 (0.8.0) | Adiciona `state.builder` (Construtor): `enabled`, `templates[]`, `profiles[]`, `log[]`, `ui`, `busy`, `premiumDetected`. `ui.activeSection` ganha `'builder'`. `BUILDING_KEYS` validado via snippet: 17 edifícios, índice 4 = `watchtower` (sem `church`/`church_f` no br142) | `migrateState` chama `migrateBuilder(parsed.builder)` que cria default se ausente. `migrateBuilder` zera `busy` e `running` de cada profile no boot |
 
 **Sempre que mudar o shape, adicionar uma linha aqui e código de migração.** Nunca quebrar usuários antigos.
 
@@ -157,6 +160,26 @@ Termos usados no código e nas conversas com o usuário:
 - **Sidebar**: 3 seções colapsáveis — "Gerente de Conta" (Construtor*/Recrutamento/Pesquisa*), "Operações" (Agendador/Painel), "Ferramentas" (Configurações*). Itens com asterisco têm badge "Em breve".
 - **Spinners de input number escondidos** (cross-browser CSS).
 - **Naming CSS**: prefixo `.mog-` em todas as classes pra não colidir com o CSS do jogo.
+
+### Captcha guard (a partir de 0.7.1 — cross-tab)
+- **Guard "lite" universal**: roda ANTES do early-return em todas as screens do TW. Define detecção (DOM + URL + fetch wrapper + XHR wrapper), banner, logout cascata, canal cross-tab. Hosts: `tripCaptcha`, `performLogout`, `setupCrossTabCaptcha`, `installFetchWrapper`, `installXhrWrapper`, `startCaptchaWatcher`.
+- **Bot full** (em `screen=storage`) registra hooks em `extraTripHandlers[]` e `reactivateHandlers[]` — só faz a parte state-aware (parar motores, zerar timers, logar). Banner + logout + broadcast vivem no lite.
+- **Canal cross-tab**:
+  - **BroadcastChannel** `mog-captcha-v1` — mensagens `{type:'TRIP'|'REACTIVATE', reason?, ts, sourceTab}`. Latência <50ms. Anti-eco via `sourceTab === TAB_ID` skip.
+  - **GM key global** `mog_captcha_global_v1` — fonte de verdade persistida `{trippedAt, reason, sourceTab}`. Sobrevive reload. Polling fallback de 3s caso BroadcastChannel falhe. **Reativar APAGA a chave** (não zera) via `GM_deleteValue`.
+- **Detecção** (`tripCaptcha` é idempotente, dedupe via `captchaHandled`):
+  - **DOM**: `MutationObserver` em `body` + selectors estritos (`[id*="botprotect"]`, iframe `hcaptcha.com` visível, etc.).
+  - **URL**: poll a cada 5s + check inicial (`screen=bot_protection`, `botprotection`).
+  - **Fetch**: wrapper em `unsafeWindow.fetch` — só inspeciona content-type HTML/JSON/text de mesma origem, primeiros 5000 chars.
+  - **XHR**: wrapper em `XMLHttpRequest.prototype.open/send` — escuta `readystatechange === 4`, mesmas regras.
+  - **Regex** estritas (não `bot[\s_-]*protection` genérico): `bot_protection_active`, `screen=bot_protection`, `popup_box_bot_protection`, `class="..botprotect..`, `\bh-captcha\b`, `hcaptcha\.com\/captcha`.
+- **Logout em cascata** (`performLogout`, `logoutInFlight` anti-loop):
+  1. `GET /index.php?action=logout&h=<csrf>` em paralelo (best-effort).
+  2. `+800ms` → `location.href = /index.php?action=logout&h=<csrf>` (ou `/index.php` sem csrf).
+  3. `+2500ms` → se ainda em `/game.php`, fallback `location.href = /logout.php`.
+- **Reativação + carência**: botão no banner apaga GM global, broadcast REACTIVATE, dispara `reactivateHandlers[]`, e chama `enterGracePeriod()` (default 60s). Durante a carência `captchaHandled` fica `true` — o monitor não dispara trip nem logout. Indicador discreto top-right com countdown + botões "+60s" e "Já resolvi". **Motivo**: após login, o TW pode estar em `screen=bot_protection` com hCaptcha ativo no DOM; sem carência, o guard re-detectaria e deslogaria antes do user resolver. `handleRemoteReactivate` (broadcast de outra aba) também entra em carência por consistência. **Motores NÃO religam automaticamente** — usuário tem que toggle global.
+- **Compat com flag local antiga**: `state.captchaTrippedAt` no `mog_state_v1` é mantido (sem migração). Se boot do bot full encontra `captchaTrippedAt > 0` mas global está vazia, "promove" pra global via `tripCaptcha('flag local migrada', { doLogout: false })`.
+- **`startGlobal()`** (botão ON do bot) também limpa GM global + broadcast REACTIVATE — garante que ligar o bot resseta o estado em todas as abas.
 
 ### Recrutador
 - **Modelos independentes**: cada profile tem scheduler próprio, toggle ON/OFF, cursor de round-robin.
@@ -260,17 +283,19 @@ Pra cada lead command (commandIndexInSource = 0):
 1. **Busy lock**: aborta se `state.farmer.busy` já é `true`. Marca `busy = true`.
 2. **Lê templates** via `Game.fetchFarmTemplates()` → `tplA`, `tplB`, `csrf`.
 3. **Lê origens** do grupo configurado.
-4. **Em paralelo**: `fetchFarmAssistantList(origins[0].id)` (bárbaras conhecidas) + `fetchOutgoingAttacks()` (Set de coords com ataque indo).
-5. **Pré-calcula plano**:
-   - `eligible = list.filter(t => !t.hadLosses && !outgoingAttacks.has(t.coords))`
-   - `planned = min(eligible × maxPerBarbarian, eligible × origens)`
-6. **Pra cada origem × bárbara conhecida**:
-   - Pula se `outgoingAttacks.has(coords)` (já tem ataque indo)
-   - Pula se `sentCount[villageId] >= maxPerBarbarian`
-   - Decide template: `hadLosses` → registra em wall-break + skip; `fullLoot` → B; default → A
+4. **Em paralelo**: `fetchFarmAssistantList(origins[0].id)` (bárbaras conhecidas) + `fetchOutgoingAttacks()` (Set de coords com ataque indo) + `fetchAllUnits(groupId)` (tropas das origens).
+5. **Não pré-fetch de relatórios no ciclo automático**. `refreshThreats` só roda via botão manual ou na tela de detalhes — economiza N GETs sequenciais por ciclo (principal causa de captcha). O cache existente em `state.farmer.threats` ainda bloqueia bárbaras com defesa conhecida via `isThreatActive`. Cache TTL 30min, delay 400-900ms entre fetches no botão manual.
+6. **Pré-calcula plano realista**: `eligible = bárbaras sem perdas, com slot livre, sem defesa detectada`. `planned` é calculado por **simulação de pareamento** (clone das tropas, pra cada bárbara elegível verifica se há origem com tropa pra A ou B; conta quantos farms cabem). Janela temporal não é simulada (precisaria ETA por par origem×alvo).
+7. **Pra cada bárbara × slot disponível** (loop invertido):
+   - `hadLosses` → registra em wall-break + skip
+   - `isThreatActive` → pula (defesa detectada)
+   - Decide template: `fullLoot` → B; senão A
+   - `pickBestOrigin(target, tpl)`: filtra origens com tropa, dentro do `maxFarmRadius` e com ETA fora da janela temporal; ordena por distância e retorna a mais próxima
+   - Se B sem origem viável → tenta A (downgrade `A↓`)
+   - Nenhuma origem viável → abandona essa bárbara (não esgota outras)
    - `Game.dispatchFarm()` com timing realista (`randomInRange(min, max)` ms)
-   - "Tropas insuficientes" → sai do loop interno, vai pra próxima origem
-7. **Finally**: `busy = false`, agenda próximo ciclo se não-manual.
+   - "Tropas insuficientes" durante dispatch → zera origem local, tenta outra origem pro mesmo slot
+8. **Finally**: `busy = false`, agenda próximo ciclo se não-manual.
 
 ### Buscar bárbaras (`findNewBarbarians`)
 

@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         MILLENIUM
-// @version      0.7.0
+// @version      0.7.2
 // @description  Toolkit pessoal para Tribal Wars
 // @match        https://*.tribalwars.com.br/game.php?*
 // @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_deleteValue
 // @grant        unsafeWindow
 // @updateURL    https://raw.githubusercontent.com/MateusObozovski/MogScripts/refs/heads/claude/tribal-wars-bot-XMdg5/dist/Mog.user.js
 // @downloadURL  https://raw.githubusercontent.com/MateusObozovski/MogScripts/refs/heads/claude/tribal-wars-bot-XMdg5/dist/Mog.user.js
@@ -15,12 +16,476 @@
 (() => {
   'use strict';
 
-  // só inicializa na tela do armazém — bot vive enquanto essa aba estiver aberta
+  // ============================================================
+  // CAPTCHA GUARD (LITE) — roda em TODA screen do TW.
+  // ============================================================
+  // O bot pesado só inicializa em screen=storage (early-return mais abaixo).
+  // Mas a detecção de captcha precisa rodar em qualquer aba do jogo: senão a
+  // aba A onde o captcha apareceu fica omissa e a aba B (storage) continua
+  // disparando requests até receber resposta com marcador. Aqui montamos um
+  // detector mínimo + canal cross-tab + logout robusto que valem pra todas.
+
+  const GLOBAL_CAPTCHA_KEY = 'mog_captcha_global_v1';
+  const CAPTCHA_CHANNEL_NAME = 'mog-captcha-v1';
+  const TAB_ID = Math.random().toString(36).slice(2, 10);
+
+  let captchaHandled = false;       // garante trip() único por aba
+  let logoutInFlight = false;       // anti-loop de redirect
+  let captchaGraceTimer = null;     // timer da carência pós-reativação
+  let captchaGraceUntil = 0;        // ts quando a carência expira
+  let graceCountdownInterval = null;
+  const GRACE_DEFAULT_MS = 60000;
+  const extraTripHandlers = [];     // bot full registra hooks de limpeza aqui
+  const reactivateHandlers = [];    // bot full registra hooks de reativação aqui
+
+  let captchaChannel = null;
+  try { captchaChannel = new BroadcastChannel(CAPTCHA_CHANNEL_NAME); } catch {}
+
+  // Marcadores típicos do hCaptcha/botprotection no TW
+  const CAPTCHA_DOM_SELECTORS = [
+    '[id*="botprotect"]',
+    '[id*="bot_check"]',
+    '[id*="botcheck"]',
+    '[class*="botprotect"]',
+    '[id*="hcaptcha"]:not([style*="display: none"])',
+    'iframe[src*="hcaptcha.com"]',
+  ];
+  // Estritas pra evitar false-positive em comentários inocentes do TW
+  const CAPTCHA_HTML_PATTERNS = [
+    /bot_protection_active/i,
+    /screen=bot_protection/i,
+    /popup_box_bot_protection/i,
+    /class\s*=\s*["'][^"']*botprotect/i,
+    /id\s*=\s*["'][^"']*botcheck/i,
+    /\bh-captcha\b/i,
+    /hcaptcha\.com\/captcha/i,
+  ];
+  const CAPTCHA_URL_PATTERNS = [
+    /screen=bot_protection/i,
+    /botprotection/i,
+  ];
+
+  function isHcaptchaIframeVisible(el) {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect?.();
+    if (!rect) return true;
+    if (rect.width === 0 && rect.height === 0) return false;
+    const style = unsafeWindow.getComputedStyle?.(el);
+    if (style?.display === 'none' || style?.visibility === 'hidden') return false;
+    return true;
+  }
+
+  function checkDomForCaptcha() {
+    if (!document.body) return null;
+    for (const sel of CAPTCHA_DOM_SELECTORS) {
+      const el = document.querySelector(sel);
+      if (!el) continue;
+      if (el.tagName === 'IFRAME' && !isHcaptchaIframeVisible(el)) continue;
+      return `DOM: ${sel}`;
+    }
+    return null;
+  }
+
+  function checkUrlForCaptcha() {
+    const url = unsafeWindow.location?.href || '';
+    for (const re of CAPTCHA_URL_PATTERNS) {
+      if (re.test(url)) return `URL: ${url}`;
+    }
+    return null;
+  }
+
+  function checkResponseForCaptcha(text, url) {
+    if (!text) return null;
+    const sample = text.slice(0, 5000);
+    for (const re of CAPTCHA_HTML_PATTERNS) {
+      if (re.test(sample)) return `RESP ${url}: ${re}`;
+    }
+    return null;
+  }
+
+  function escapeHtmlForBanner(s) {
+    return String(s).replace(/[&<>"]/g, c => ({
+      '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;',
+    }[c]));
+  }
+
+  function showCaptchaBanner(reason, onReactivate) {
+    if (!document.body) {
+      // body ainda não pronto — adia até DOMContentLoaded
+      const retry = () => showCaptchaBanner(reason, onReactivate);
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', retry, { once: true });
+      } else {
+        setTimeout(retry, 50);
+      }
+      return;
+    }
+    if (document.getElementById('mog-captcha-banner')) return;
+    const div = document.createElement('div');
+    div.id = 'mog-captcha-banner';
+    div.style.cssText = [
+      'position:fixed', 'inset:0', 'z-index:2147483647',
+      'background:rgba(120,15,15,0.96)',
+      'color:#fff', 'font-family:system-ui,sans-serif',
+      'display:flex', 'align-items:center', 'justify-content:center',
+      'flex-direction:column', 'gap:18px', 'padding:40px',
+      'text-align:center',
+    ].join(';');
+    div.innerHTML = `
+      <div style="font-size:56px;line-height:1;">🚨</div>
+      <div style="font-size:24px;font-weight:700;letter-spacing:0.5px;">CAPTCHA DETECTADO</div>
+      <div style="font-size:14px;max-width:520px;line-height:1.5;color:#ffe6e6;">
+        O Tribal Wars solicitou verificação humana. Pra evitar banimento, o bot foi
+        desligado e o jogo será deslogado em instantes.<br><br>
+        Quando voltar a jogar, faça login novamente e clique abaixo pra reativar o bot.
+      </div>
+      <button id="mog-captcha-reactivate" style="
+        background:#fff;color:#7a1a1a;border:none;
+        padding:12px 24px;border-radius:6px;
+        font-size:13px;font-weight:700;cursor:pointer;
+        letter-spacing:0.4px;text-transform:uppercase;
+        transition:filter 0.15s;
+      ">✓ Já estou logado, reativar bot</button>
+      <div style="font-size:11px;color:#ffaaaa;font-family:monospace;opacity:0.7;">
+        gatilho: ${escapeHtmlForBanner(reason)}
+      </div>
+    `;
+    document.body.appendChild(div);
+    const btn = div.querySelector('#mog-captcha-reactivate');
+    if (btn && typeof onReactivate === 'function') {
+      btn.addEventListener('click', () => {
+        try { onReactivate(); } catch {}
+        div.remove();
+      });
+    }
+  }
+
+  function readGlobalTrip() {
+    try {
+      const raw = (typeof GM_getValue === 'function') ? GM_getValue(GLOBAL_CAPTCHA_KEY, null) : null;
+      if (!raw) return null;
+      return (typeof raw === 'string') ? JSON.parse(raw) : raw;
+    } catch { return null; }
+  }
+  function writeGlobalTrip(reason) {
+    try {
+      if (typeof GM_setValue !== 'function') return;
+      GM_setValue(GLOBAL_CAPTCHA_KEY, JSON.stringify({
+        trippedAt: Date.now(), reason: String(reason || ''), sourceTab: TAB_ID,
+      }));
+    } catch {}
+  }
+  function clearGlobalTrip() {
+    try {
+      if (typeof GM_deleteValue === 'function') GM_deleteValue(GLOBAL_CAPTCHA_KEY);
+      else if (typeof GM_setValue === 'function') GM_setValue(GLOBAL_CAPTCHA_KEY, '');
+    } catch {}
+  }
+
+  // ----- carência pós-reativação -----
+  // Quando o user clica "reativar" depois de logar de volta, ele precisa de
+  // tempo pra resolver o captcha do TW (que está na tela). Durante a carência
+  // o guard fica silencioso (captchaHandled=true) — não trippa nem desloga.
+  function enterGracePeriod(durationMs) {
+    const ms = durationMs || GRACE_DEFAULT_MS;
+    captchaHandled = true;       // silencia detecção
+    logoutInFlight = false;
+    captchaGraceUntil = Date.now() + ms;
+    if (captchaGraceTimer) clearTimeout(captchaGraceTimer);
+    captchaGraceTimer = setTimeout(exitGracePeriod, ms);
+    showGraceIndicator();
+  }
+
+  function extendGracePeriod(extraMs) {
+    const add = extraMs || GRACE_DEFAULT_MS;
+    captchaGraceUntil = (captchaGraceUntil || Date.now()) + add;
+    if (captchaGraceTimer) clearTimeout(captchaGraceTimer);
+    captchaGraceTimer = setTimeout(exitGracePeriod, Math.max(0, captchaGraceUntil - Date.now()));
+    updateGraceIndicator();
+  }
+
+  function exitGracePeriod() {
+    captchaHandled = false;
+    if (captchaGraceTimer) { clearTimeout(captchaGraceTimer); captchaGraceTimer = null; }
+    captchaGraceUntil = 0;
+    if (graceCountdownInterval) { clearInterval(graceCountdownInterval); graceCountdownInterval = null; }
+    const ind = document.getElementById('mog-captcha-grace');
+    if (ind) ind.remove();
+  }
+
+  function showGraceIndicator() {
+    if (!document.body) {
+      document.addEventListener('DOMContentLoaded', showGraceIndicator, { once: true });
+      return;
+    }
+    const old = document.getElementById('mog-captcha-grace');
+    if (old) old.remove();
+    const div = document.createElement('div');
+    div.id = 'mog-captcha-grace';
+    div.style.cssText = [
+      'position:fixed', 'top:8px', 'right:8px', 'z-index:2147483646',
+      'background:rgba(120,15,15,0.92)', 'color:#fff',
+      'padding:10px 14px', 'border-radius:6px',
+      'font-family:system-ui,sans-serif', 'font-size:12px',
+      'display:flex', 'align-items:center', 'gap:10px',
+      'box-shadow:0 4px 12px rgba(0,0,0,0.4)',
+    ].join(';');
+    div.innerHTML = `
+      <span>⏳ Resolva o captcha — monitor pausado por <span id="mog-grace-count">60</span>s</span>
+      <button id="mog-grace-extend" style="
+        background:#fff;color:#7a1a1a;border:none;padding:4px 8px;
+        border-radius:3px;font-size:11px;font-weight:700;cursor:pointer;
+      ">+60s</button>
+      <button id="mog-grace-done" style="
+        background:transparent;color:#fff;border:1px solid rgba(255,255,255,0.5);
+        padding:4px 8px;border-radius:3px;font-size:11px;font-weight:700;cursor:pointer;
+      ">Já resolvi</button>
+    `;
+    document.body.appendChild(div);
+    div.querySelector('#mog-grace-extend')?.addEventListener('click', () => extendGracePeriod());
+    div.querySelector('#mog-grace-done')?.addEventListener('click', () => exitGracePeriod());
+    if (graceCountdownInterval) clearInterval(graceCountdownInterval);
+    graceCountdownInterval = setInterval(updateGraceIndicator, 1000);
+    updateGraceIndicator();
+  }
+
+  function updateGraceIndicator() {
+    const span = document.getElementById('mog-grace-count');
+    if (!span) return;
+    const remaining = Math.max(0, Math.ceil((captchaGraceUntil - Date.now()) / 1000));
+    span.textContent = String(remaining);
+  }
+
+  // Logout em cascata — primeiro tenta endpoint canônico, depois fallback legado.
+  function performLogout() {
+    if (logoutInFlight) return;
+    logoutInFlight = true;
+    const csrf = unsafeWindow.game_data?.csrf || '';
+    const primary = csrf ? `/index.php?action=logout&h=${csrf}` : '/index.php?action=logout';
+
+    // Best-effort: dispara request em paralelo (não bloqueia o redirect)
+    if (csrf) {
+      try {
+        fetch(primary, { credentials: 'include', method: 'GET' }).catch(() => {});
+      } catch {}
+    }
+
+    setTimeout(() => {
+      try { unsafeWindow.location.href = primary; } catch {
+        try { unsafeWindow.location.replace(primary); } catch {}
+      }
+    }, 800);
+
+    // Fallback legado: se 2.5s depois ainda estamos em /game.php, força /logout.php
+    setTimeout(() => {
+      try {
+        const path = unsafeWindow.location?.pathname || '';
+        if (path.startsWith('/game.php')) {
+          unsafeWindow.location.href = '/logout.php';
+        }
+      } catch {}
+    }, 2500);
+  }
+
+  function tripCaptcha(reason, opts) {
+    if (captchaHandled) return;
+    captchaHandled = true;
+    const persistGlobal = !opts || opts.persistGlobal !== false;
+    const broadcast = !opts || opts.broadcast !== false;
+    const doLogout = !opts || opts.doLogout !== false;
+
+    if (persistGlobal) writeGlobalTrip(reason);
+    if (broadcast && captchaChannel) {
+      try { captchaChannel.postMessage({ type: 'TRIP', reason, ts: Date.now(), sourceTab: TAB_ID }); } catch {}
+    }
+
+    // hooks do bot full (limpeza de state, timers, log) — best-effort, não pode bloquear
+    for (const fn of extraTripHandlers) {
+      try { fn(reason); } catch {}
+    }
+
+    showCaptchaBanner(reason, () => {
+      // reativação local: apaga GM global, broadcast pra outras abas, hooks
+      // do bot full, e ENTRA EM CARÊNCIA. Durante a carência o monitor fica
+      // silencioso pra dar tempo do user resolver o captcha do TW que está na tela.
+      clearGlobalTrip();
+      if (captchaChannel) {
+        try { captchaChannel.postMessage({ type: 'REACTIVATE', ts: Date.now(), sourceTab: TAB_ID }); } catch {}
+      }
+      for (const fn of reactivateHandlers) { try { fn(); } catch {} }
+      enterGracePeriod();
+    });
+
+    if (doLogout) {
+      setTimeout(performLogout, 1500);
+    }
+  }
+
+  function handleRemoteReactivate() {
+    const banner = document.getElementById('mog-captcha-banner');
+    if (banner) banner.remove();
+    for (const fn of reactivateHandlers) { try { fn(); } catch {} }
+    enterGracePeriod();
+  }
+
+  function setupCrossTabCaptcha() {
+    if (captchaChannel) {
+      captchaChannel.addEventListener('message', (ev) => {
+        const data = ev?.data || {};
+        if (data.sourceTab === TAB_ID) return;
+        if (data.type === 'TRIP') {
+          // outra aba detectou — entra em modo trippado, mas não rebroadcast nem repersist.
+          // Logout opcional: se a outra aba já está fazendo, esta também faz pra garantir.
+          tripCaptcha('OUTRA ABA: ' + (data.reason || ''), {
+            persistGlobal: false, broadcast: false, doLogout: true,
+          });
+        } else if (data.type === 'REACTIVATE') {
+          handleRemoteReactivate();
+        }
+      });
+    }
+
+    // Polling fallback: 3s. Detecta GM key escrita por aba que não tem BroadcastChannel.
+    setInterval(() => {
+      const g = readGlobalTrip();
+      if (captchaHandled) {
+        // se trippado mas global foi apagada → outra aba reativou
+        if (!g) handleRemoteReactivate();
+        return;
+      }
+      if (g && g.trippedAt) {
+        tripCaptcha('GLOBAL: ' + (g.reason || ''), {
+          persistGlobal: false, broadcast: false, doLogout: true,
+        });
+      }
+    }, 3000);
+  }
+
+  function installFetchWrapper() {
+    const orig = unsafeWindow.fetch?.bind(unsafeWindow);
+    if (!orig) return;
+    unsafeWindow.fetch = async function (...args) {
+      const res = await orig(...args);
+      if (captchaHandled) return res;
+      try {
+        const reqUrl = (typeof args[0] === 'string' ? args[0] : args[0]?.url) || '';
+        const isAbsolute = /^https?:\/\//.test(reqUrl);
+        const isSameOrigin = !isAbsolute || reqUrl.includes('tribalwars.com.br');
+        if (reqUrl && isSameOrigin) {
+          const clone = res.clone();
+          const ct = clone.headers.get('content-type') || '';
+          if (/text\/html|application\/json|text\/plain/i.test(ct)) {
+            const text = await clone.text();
+            const hit = checkResponseForCaptcha(text, reqUrl);
+            if (hit) tripCaptcha(hit);
+          }
+        }
+      } catch {}
+      return res;
+    };
+  }
+
+  function installXhrWrapper() {
+    const XHR = unsafeWindow.XMLHttpRequest;
+    if (!XHR || !XHR.prototype) return;
+    const origOpen = XHR.prototype.open;
+    const origSend = XHR.prototype.send;
+    XHR.prototype.open = function (method, url, ...rest) {
+      try { this._mogUrl = url; } catch {}
+      return origOpen.call(this, method, url, ...rest);
+    };
+    XHR.prototype.send = function (...args) {
+      try {
+        this.addEventListener('readystatechange', () => {
+          if (this.readyState !== 4) return;
+          if (captchaHandled) return;
+          try {
+            const url = String(this._mogUrl || '');
+            if (!url) return;
+            const isAbsolute = /^https?:\/\//.test(url);
+            const isSameOrigin = !isAbsolute || url.includes('tribalwars.com.br');
+            if (!isSameOrigin) return;
+            const ct = this.getResponseHeader('content-type') || '';
+            if (!/text\/html|application\/json|text\/plain/i.test(ct)) return;
+            // só lê se tipo string (responseType vazio ou 'text')
+            const rt = this.responseType;
+            if (rt && rt !== 'text') return;
+            const text = this.responseText || '';
+            const hit = checkResponseForCaptcha(text, url);
+            if (hit) tripCaptcha(hit);
+          } catch {}
+        });
+      } catch {}
+      return origSend.apply(this, args);
+    };
+  }
+
+  function startCaptchaWatcher() {
+    // 1. observer DOM (espera body se necessário)
+    const startObserver = () => {
+      if (!document.body) {
+        document.addEventListener('DOMContentLoaded', startObserver, { once: true });
+        return;
+      }
+      const obs = new MutationObserver(() => {
+        if (captchaHandled) return;
+        const hit = checkDomForCaptcha();
+        if (hit) tripCaptcha(hit);
+      });
+      obs.observe(document.body, { childList: true, subtree: true });
+    };
+    startObserver();
+
+    // 2. URL agora
+    const urlHit = checkUrlForCaptcha();
+    if (urlHit) { tripCaptcha(urlHit); return; }
+
+    // 3. DOM agora (se body já pronto)
+    const domHit = checkDomForCaptcha();
+    if (domHit) { tripCaptcha(domHit); return; }
+
+    // 4. wrappers
+    installFetchWrapper();
+    installXhrWrapper();
+
+    // 5. URL polling (caso navegação interna do TW)
+    setInterval(() => {
+      if (captchaHandled) return;
+      const u = checkUrlForCaptcha();
+      if (u) tripCaptcha(u);
+    }, 5000);
+  }
+
+  // boot do guard lite
+  setupCrossTabCaptcha();
+  startCaptchaWatcher();
+
+  // se já existe flag global persistida (de aba anterior ou reload), entra em modo trippado
+  // sem rebroadcast/relogout (já feito pela aba que originou). Só mostra banner.
+  {
+    const initial = readGlobalTrip();
+    if (initial && initial.trippedAt) {
+      captchaHandled = true;
+      const reason = 'flag persistida' + (initial.reason ? ' — ' + initial.reason : '');
+      showCaptchaBanner(reason, () => {
+        clearGlobalTrip();
+        if (captchaChannel) {
+          try { captchaChannel.postMessage({ type: 'REACTIVATE', ts: Date.now(), sourceTab: TAB_ID }); } catch {}
+        }
+        for (const fn of reactivateHandlers) { try { fn(); } catch {} }
+        enterGracePeriod();
+      });
+    }
+  }
+
+  // ============================================================
+  // EARLY-RETURN: bot pesado só roda em screen=storage
+  // ============================================================
   if (typeof unsafeWindow !== 'undefined' && unsafeWindow.game_data?.screen !== 'storage') {
     return;
   }
 
-  const VERSION = '0.7.0';
+  const VERSION = '0.7.2';
   const STORAGE_KEY = 'mog_state_v1';
 
   const UNITS = [
@@ -48,6 +513,54 @@
 
   const GROUP_ALL = { id: 0, name: 'Todos' };
 
+  // Mapa indexado pelo decoder de templates de construção (formato `bgAA...`).
+  // Cada índice = building key interna do TW (compatível com URL de upgrade).
+  // Ordem precisa ser validada com template conhecido — ver Apêndice A do CLAUDE.md.
+  // Validado via snippet de screen=main: indices 0–16 mapeiam para as 17 chaves reais
+  // do br142. church/church_f não aparecem neste mundo — índices 4–5 são watchtower/snob.
+  const BUILDING_KEYS = [
+    'main',        // 0  Edifício Principal
+    'barracks',    // 1  Quartel
+    'stable',      // 2  Estábulo
+    'garage',      // 3  Oficina
+    'watchtower',  // 4  Torre de Vigia
+    'snob',        // 5  Academia
+    'smith',       // 6  Ferreiro
+    'place',       // 7  Praça de Reunião
+    'statue',      // 8  Estátua
+    'market',      // 9  Mercado
+    'wood',        // 10 Bosque
+    'stone',       // 11 Poço de Argila
+    'iron',        // 12 Mina de Ferro
+    'farm',        // 13 Fazenda
+    'storage',     // 14 Armazém
+    'hide',        // 15 Esconderijo
+    'wall',        // 16 Muralha
+  ];
+
+  const BUILDING_DISPLAY = {
+    main:        { label: 'Edifício Principal',  icon: '🏛' },
+    barracks:    { label: 'Quartel',             icon: '⚔' },
+    stable:      { label: 'Estábulo',            icon: '🐎' },
+    garage:      { label: 'Oficina',             icon: '⚙' },
+    watchtower:  { label: 'Torre de Vigia',      icon: '👁' },
+    snob:        { label: 'Academia',            icon: '🎓' },
+    smith:       { label: 'Ferreiro',            icon: '🔨' },
+    place:       { label: 'Praça de Reunião',    icon: '🏟' },
+    statue:      { label: 'Estátua',             icon: '🗿' },
+    market:      { label: 'Mercado',             icon: '🛒' },
+    wood:        { label: 'Bosque',              icon: '🌲' },
+    stone:       { label: 'Poço de Argila',      icon: '🧱' },
+    iron:        { label: 'Mina de Ferro',       icon: '⛏' },
+    farm:        { label: 'Fazenda',             icon: '🌾' },
+    storage:     { label: 'Armazém',             icon: '📦' },
+    hide:        { label: 'Esconderijo',         icon: '🕳' },
+    wall:        { label: 'Muralha',             icon: '🛡' },
+    // mundos com religião — podem aparecer em templates importados de outros mundos
+    church:      { label: 'Igreja',              icon: '✝' },
+    church_f:    { label: 'Primeira Igreja',     icon: '✝' },
+  };
+
   function makeProfile(overrides = {}) {
     return {
       id: overrides.id || `p_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -66,6 +579,31 @@
       }])),
       rrCursor: overrides.rrCursor || Object.fromEntries(BUILDINGS.map(b => [b, 0])),
       nextRunAt: 0,
+    };
+  }
+
+  function makeBuildTemplate(overrides = {}) {
+    return {
+      id: overrides.id || `bt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      name: overrides.name || 'Modelo importado',
+      raw: overrides.raw || '',
+      createdAt: overrides.createdAt || Date.now(),
+      steps: Array.isArray(overrides.steps) ? overrides.steps : [],
+    };
+  }
+
+  function makeBuildProfile(overrides = {}) {
+    return {
+      id: overrides.id || `bp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      name: overrides.name || 'Novo modelo',
+      enabled: overrides.enabled ?? false,
+      groupId: overrides.groupId ?? 0,
+      templateId: overrides.templateId || null,
+      intervalMin: overrides.intervalMin ?? 5,
+      intervalMax: overrides.intervalMax ?? 7,
+      parallelQueue: overrides.parallelQueue ?? 2,
+      nextRunAt: overrides.nextRunAt || 0,
+      running: null,
     };
   }
 
@@ -168,12 +706,11 @@
   };
 
   const DEFAULT_LATENCY = {
-    avgRtt: 0,            // ms (ida+volta)
-    avgOffset: 0,         // ms (clock diff: servidor − cliente)
-    manualOverride: 0,    // ms (se >0, usa esse valor, ignora medição auto)
-    measuredAt: 0,        // timestamp da última medição
-    samples: 0,           // quantas medições já foram feitas
-    extraBuffer: 300,     // ms adicionais à compensação (tempo do servidor processar o POST). Ajustável.
+    avgRtt: 0,         // ms (ida+volta)
+    avgOffset: 0,      // ms (clock diff: servidor − cliente)
+    manualOverride: 0, // ms (se >0, usa esse valor, ignora medição auto)
+    measuredAt: 0,     // timestamp da última medição
+    samples: 0,        // quantas medições já foram feitas
   };
 
   const DEFAULT_STATE = {
@@ -207,10 +744,9 @@
       cycleMin: 10,
       maxPerBarbarian: 1,
       searchRadius: 10,
-      // Modo seguro: só farma bárbaras com último relatório limpo dentro do TTL.
-      // Quando ON, ciclo espiona bárbaras sem threats ativo antes de farmar (+1 ciclo de espera).
-      // Default ON pra evitar perdas com bárbaras nunca espionadas.
-      safeMode: true,
+      // Raio máximo (campos) entre origem e bárbara no ciclo. Bárbaras fora do
+      // alcance de qualquer origem são puladas. 0 = sem limite.
+      maxFarmRadius: 15,
       // Janela mínima entre chegadas de farms na mesma bárbara (minutos).
       // Default 10min pra dar tempo da bárbara regenerar saque entre ataques.
       // Aplicado quando conseguimos parsear o horário de chegada dos comandos.
@@ -225,6 +761,16 @@
       ui: { collapsed: {} },
       nextRunAt: 0,
       busy: false,
+    },
+    builder: {
+      enabled: false,
+      templates: [],
+      profiles: [],
+      log: [],
+      ui: { expandedProfileId: null, view: 'profiles' },
+      busy: false,
+      // Cache: detectado no primeiro fetchMainBuilding bem-sucedido. null = ainda não medido.
+      premiumDetected: null,
     },
   };
 
@@ -297,6 +843,11 @@
     }
     if (parsed.latency) {
       base.latency = { ...base.latency, ...parsed.latency };
+      // Remove campos de versões antigas que não existem mais no DEFAULT_LATENCY
+      delete base.latency.skewHistory;
+      delete base.latency.skewMedian;
+      delete base.latency.adaptiveComp;
+      delete base.latency.extraBuffer;
     }
     if (Array.isArray(parsed.log)) base.log = parsed.log;
     if (parsed.ui) base.ui = { ...base.ui, ...parsed.ui };
@@ -312,7 +863,7 @@
     if (Number.isFinite(parsed.cycleMin)) base.cycleMin = parsed.cycleMin;
     if (Number.isFinite(parsed.maxPerBarbarian)) base.maxPerBarbarian = parsed.maxPerBarbarian;
     if (Number.isFinite(parsed.searchRadius)) base.searchRadius = parsed.searchRadius;
-    if (typeof parsed.safeMode === 'boolean') base.safeMode = parsed.safeMode;
+    if (Number.isFinite(parsed.maxFarmRadius)) base.maxFarmRadius = parsed.maxFarmRadius;
     if (Number.isFinite(parsed.arrivalWindowMin)) base.arrivalWindowMin = parsed.arrivalWindowMin;
     if (Array.isArray(parsed.needsWallBreak)) base.needsWallBreak = parsed.needsWallBreak;
     if (Array.isArray(parsed.threats)) base.threats = parsed.threats;
@@ -324,6 +875,39 @@
     return base;
   }
 
+  function migrateBuilderTemplate(t) {
+    return makeBuildTemplate({
+      ...t,
+      steps: Array.isArray(t.steps) ? t.steps.filter(s => typeof s === 'string') : [],
+    });
+  }
+
+  function migrateBuilderProfile(p) {
+    return makeBuildProfile({
+      ...p,
+      // running é transitório
+      running: null,
+    });
+  }
+
+  function migrateBuilder(parsed) {
+    const base = structuredClone(DEFAULT_STATE.builder);
+    if (!parsed) return base;
+    base.enabled = !!parsed.enabled;
+    if (Array.isArray(parsed.templates)) {
+      base.templates = parsed.templates.map(migrateBuilderTemplate);
+    }
+    if (Array.isArray(parsed.profiles)) {
+      base.profiles = parsed.profiles.map(migrateBuilderProfile);
+    }
+    if (Array.isArray(parsed.log)) base.log = parsed.log;
+    if (parsed.ui) base.ui = { ...base.ui, ...parsed.ui };
+    if (typeof parsed.premiumDetected === 'boolean') base.premiumDetected = parsed.premiumDetected;
+    // busy é transitório — limpa no boot
+    base.busy = false;
+    return base;
+  }
+
   function migrateState(parsed) {
     const base = structuredClone(DEFAULT_STATE);
     base.enabled = parsed.enabled ?? false;
@@ -331,6 +915,7 @@
     if (parsed.ui) base.ui = { ...base.ui, ...parsed.ui };
     base.scheduler = migrateScheduler(parsed.scheduler);
     base.farmer = migrateFarmer(parsed.farmer);
+    base.builder = migrateBuilder(parsed.builder);
 
     if (parsed.recruiter?.profiles) {
       base.recruiter.profiles = parsed.recruiter.profiles.map(p => migrateProfile(p));
@@ -358,77 +943,11 @@
   let state = loadState();
   const persist = () => saveState(state);
 
-  // ---------- captcha guard ----------
-  // Detecta captcha (botcheck) do TW e desliga TUDO + faz logout pra evitar ban.
-  // Heurísticas redundantes (DOM, URL, fetch responses) — prefere falso-positivo.
-  let captchaHandled = false;     // garante que trip() roda só 1x
-
-  // Marcadores típicos do hCaptcha/botprotection no TW
-  const CAPTCHA_DOM_SELECTORS = [
-    '[id*="botprotect"]',
-    '[id*="bot_check"]',
-    '[id*="botcheck"]',
-    '[class*="botprotect"]',
-    '[id*="hcaptcha"]:not([style*="display: none"])',
-    'iframe[src*="hcaptcha.com"]',
-  ];
-  const CAPTCHA_HTML_PATTERNS = [
-    /bot_protection_active/i,
-    /bot[\s_-]*protection/i,
-    /botcheck/i,
-    /screen=bot_protection/i,
-    /h-captcha/i,
-    /hcaptcha\.com\/captcha/i,
-  ];
-  const CAPTCHA_URL_PATTERNS = [
-    /screen=bot_protection/i,
-    /botprotection/i,
-  ];
-
-  function isHcaptchaIframeVisible(el) {
-    // pra evitar falso positivo de iframe pré-carregado escondido
-    if (!el) return false;
-    const rect = el.getBoundingClientRect?.();
-    if (!rect) return true;     // sem layout, considera visível por segurança
-    if (rect.width === 0 && rect.height === 0) return false;
-    const style = unsafeWindow.getComputedStyle?.(el);
-    if (style?.display === 'none' || style?.visibility === 'hidden') return false;
-    return true;
-  }
-
-  function checkDomForCaptcha() {
-    for (const sel of CAPTCHA_DOM_SELECTORS) {
-      const el = document.querySelector(sel);
-      if (!el) continue;
-      // iframes podem estar pré-carregados invisíveis; só dispara se visível
-      if (el.tagName === 'IFRAME' && !isHcaptchaIframeVisible(el)) continue;
-      return `DOM: ${sel}`;
-    }
-    return null;
-  }
-
-  function checkUrlForCaptcha() {
-    const url = unsafeWindow.location?.href || '';
-    for (const re of CAPTCHA_URL_PATTERNS) {
-      if (re.test(url)) return `URL: ${url}`;
-    }
-    return null;
-  }
-
-  function checkResponseForCaptcha(text, url) {
-    if (!text) return null;
-    // limita a inspecionar só os primeiros 5000 chars pra performance
-    const sample = text.slice(0, 5000);
-    for (const re of CAPTCHA_HTML_PATTERNS) {
-      if (re.test(sample)) return `RESP ${url}: ${re}`;
-    }
-    return null;
-  }
-
-  // Trip único: para tudo, persiste flag, logout, banner. Idempotente.
-  function tripCaptcha(reason) {
-    if (captchaHandled) return;
-    captchaHandled = true;
+  // ---------- captcha guard (hooks do bot full) ----------
+  // O detector + banner + logout vivem no guard lite no topo do IIFE.
+  // Aqui registramos só a limpeza state-aware: parar motores, zerar timers,
+  // logar nos buffers do bot, e zerar a flag local na reativação.
+  extraTripHandlers.push((reason) => {
     state.captchaTrippedAt = Date.now();
     state.enabled = false;
     if (state.farmer) {
@@ -439,30 +958,49 @@
     if (Array.isArray(state.recruiter?.profiles)) {
       state.recruiter.profiles.forEach(p => { p.nextRunAt = 0; });
     }
-    persist();
+    if (state.builder) {
+      state.builder.enabled = false;
+      state.builder.busy = false;
+      if (Array.isArray(state.builder.profiles)) {
+        state.builder.profiles.forEach(p => { p.nextRunAt = 0; p.running = null; });
+      }
+    }
+    try { persist(); } catch {}
 
-    // limpa todos os timers conhecidos. Cada engine tem o seu Map/var.
+    // limpa timers (cada engine tem seu Map/var; usar typeof pra tolerar
+    // hook rodando antes da inicialização dos motores)
     try {
-      if (typeof profileTimers !== 'undefined' && profileTimers.clear) {
+      if (typeof profileTimers !== 'undefined' && profileTimers?.clear) {
         profileTimers.forEach(t => clearTimeout(t));
         profileTimers.clear();
       }
     } catch {}
     try { if (typeof farmerTimerId !== 'undefined') clearTimeout(farmerTimerId); } catch {}
     try {
-      if (typeof commandTimers !== 'undefined' && commandTimers.clear) {
+      if (typeof commandTimers !== 'undefined' && commandTimers?.clear) {
         commandTimers.forEach(t => clearTimeout(t));
         commandTimers.clear();
       }
     } catch {}
     try {
-      if (typeof prepareTimers !== 'undefined' && prepareTimers.clear) {
+      if (typeof prepareTimers !== 'undefined' && prepareTimers?.clear) {
         prepareTimers.forEach(t => clearTimeout(t));
         prepareTimers.clear();
       }
     } catch {}
+    try {
+      if (typeof remeasureTimers !== 'undefined' && remeasureTimers?.clear) {
+        remeasureTimers.forEach(t => clearTimeout(t));
+        remeasureTimers.clear();
+      }
+    } catch {}
+    try {
+      if (typeof builderTimers !== 'undefined' && builderTimers?.clear) {
+        builderTimers.forEach(t => clearTimeout(t));
+        builderTimers.clear();
+      }
+    } catch {}
 
-    // log + banner + logout
     try {
       const ts = new Date().toLocaleTimeString('pt-BR');
       const entry = `[${ts}] 🚨 CAPTCHA DETECTADO (${reason}) — bot parado e logout disparado.`;
@@ -481,135 +1019,28 @@
         state.scheduler.log.unshift(entry);
         state.scheduler.log = state.scheduler.log.slice(0, 500);
       }
+      if (state.builder) {
+        state.builder.log = state.builder.log || [];
+        state.builder.log.unshift(entry);
+        state.builder.log = state.builder.log.slice(0, 200);
+      }
       persist();
     } catch {}
+  });
 
-    showCaptchaBanner(reason);
-
-    // logout: dispara request E redireciona pra garantir que sessão fecha
-    setTimeout(() => {
-      try {
-        unsafeWindow.location.href = '/logout.php';
-      } catch {
-        try { unsafeWindow.location.replace('/logout.php'); } catch {}
-      }
-    }, 1500);     // 1.5s pra usuário ver o banner antes de redirecionar
-  }
-
-  function showCaptchaBanner(reason) {
-    // banner full-screen vermelho, não-fechável, sobrepõe tudo
-    if (document.getElementById('mog-captcha-banner')) return;
-    const div = document.createElement('div');
-    div.id = 'mog-captcha-banner';
-    div.style.cssText = [
-      'position:fixed', 'inset:0', 'z-index:2147483647',
-      'background:rgba(120,15,15,0.96)',
-      'color:#fff', 'font-family:system-ui,sans-serif',
-      'display:flex', 'align-items:center', 'justify-content:center',
-      'flex-direction:column', 'gap:18px', 'padding:40px',
-      'text-align:center',
-    ].join(';');
-    div.innerHTML = `
-      <div style="font-size:56px;line-height:1;">🚨</div>
-      <div style="font-size:24px;font-weight:700;letter-spacing:0.5px;">CAPTCHA DETECTADO</div>
-      <div style="font-size:14px;max-width:520px;line-height:1.5;color:#ffe6e6;">
-        O Tribal Wars solicitou verificação humana. Pra evitar banimento, o bot foi
-        desligado e o jogo será deslogado em instantes.<br><br>
-        Quando voltar a jogar, faça login novamente e clique abaixo pra reativar o bot.
-      </div>
-      <button id="mog-captcha-reactivate" style="
-        background:#fff;color:#7a1a1a;border:none;
-        padding:12px 24px;border-radius:6px;
-        font-size:13px;font-weight:700;cursor:pointer;
-        letter-spacing:0.4px;text-transform:uppercase;
-        transition:filter 0.15s;
-      ">✓ Já estou logado, reativar bot</button>
-      <div style="font-size:11px;color:#ffaaaa;font-family:monospace;opacity:0.7;">
-        gatilho: ${escapeHtmlForBanner(reason)}
-      </div>
-    `;
-    document.body.appendChild(div);
-    const btn = div.querySelector('#mog-captcha-reactivate');
-    if (btn) {
-      btn.addEventListener('click', () => {
-        // limpa flag, remove banner, reativa observer
-        state.captchaTrippedAt = 0;
-        captchaHandled = false;
-        persist();
-        div.remove();
-      });
+  reactivateHandlers.push(() => {
+    if (state.captchaTrippedAt) {
+      state.captchaTrippedAt = 0;
+      try { persist(); } catch {}
     }
+  });
+
+  // Compat: se este storage tem flag local persistida (de versão antiga) mas o
+  // guard lite não detectou flag global, "promove" pra global pra todas as
+  // abas verem. Sem logout (já feito antes do reload).
+  if (state.captchaTrippedAt > 0 && !readGlobalTrip()) {
+    tripCaptcha('flag local migrada', { doLogout: false });
   }
-
-  function escapeHtmlForBanner(s) {
-    return String(s).replace(/[&<>"]/g, c => ({
-      '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;',
-    }[c]));
-  }
-
-  function startCaptchaWatcher() {
-    // se já trippado, não monitora — usuário precisa reativar manualmente
-    if (state.captchaTrippedAt > 0 && !state.enabled && !state.farmer?.enabled) {
-      // nada a fazer; toggle global limpa flag quando user reativar
-    }
-
-    // 1. observa DOM
-    const obs = new MutationObserver(() => {
-      if (captchaHandled) return;
-      const hit = checkDomForCaptcha();
-      if (hit) tripCaptcha(hit);
-    });
-    obs.observe(document.body, { childList: true, subtree: true });
-
-    // 2. verifica URL agora (caso já tenhamos sido redirecionados)
-    const urlHit = checkUrlForCaptcha();
-    if (urlHit) { tripCaptcha(urlHit); return; }
-
-    // 3. verifica DOM agora
-    const domHit = checkDomForCaptcha();
-    if (domHit) { tripCaptcha(domHit); return; }
-
-    // 4. wrapper em fetch global pra inspecionar respostas. Não toca em XHR
-    // legado nem em sendBeacon — fetch cobre 99% do TW moderno.
-    const origFetch = unsafeWindow.fetch.bind(unsafeWindow);
-    unsafeWindow.fetch = async function (...args) {
-      const res = await origFetch(...args);
-      if (captchaHandled) return res;
-      try {
-        // só inspeciona requests pro mesmo domínio (TW). Evita ler hcaptcha.com etc.
-        const reqUrl = (typeof args[0] === 'string' ? args[0] : args[0]?.url) || '';
-        if (reqUrl && !/^https?:\/\//.test(reqUrl) || reqUrl.includes('tribalwars.com.br')) {
-          // clona resposta pra não consumir o body do caller
-          const clone = res.clone();
-          const ct = clone.headers.get('content-type') || '';
-          if (/text\/html|application\/json|text\/plain/i.test(ct)) {
-            const text = await clone.text();
-            const hit = checkResponseForCaptcha(text, reqUrl);
-            if (hit) tripCaptcha(hit);
-          }
-        }
-      } catch {}
-      return res;
-    };
-
-    // 5. periodicamente verifica URL (caso navegação interna do TW troque sem MutationObserver pegar)
-    setInterval(() => {
-      if (captchaHandled) return;
-      const u = checkUrlForCaptcha();
-      if (u) tripCaptcha(u);
-    }, 5000);
-  }
-
-  // se já estamos trippados (state persistido com flag), mostra banner e bloqueia
-  // qualquer auto-start. Usuário tem que clicar no toggle global pra zerar.
-  if (state.captchaTrippedAt > 0) {
-    captchaHandled = true;     // bloqueia trip duplo, mas auto-start já é bloqueado pelo enabled=false
-    // banner aparece quando o body estiver pronto
-    if (document.body) showCaptchaBanner('flag persistida — desative manualmente');
-    else document.addEventListener('DOMContentLoaded', () => showCaptchaBanner('flag persistida — desative manualmente'));
-  }
-
-  startCaptchaWatcher();
 
   // ---------- game api ----------
   const Game = {
@@ -640,6 +1071,8 @@
       const all = [];
       const seen = new Set();
       for (let page = 0; page < 50; page++) {
+        // delay entre páginas (não antes da 1ª) — evita rajada regular detectável como bot.
+        if (page > 0) await sleep(randomInRange(400, 900));
         const url = `/game.php?screen=overview_villages&mode=combined${extraQs}&page=${page}`;
         const res = await fetch(url, { credentials: 'include' });
         const html = await res.text();
@@ -949,6 +1382,40 @@
       return data || { ok: true };
     },
 
+    // Lê screen=main de uma aldeia e parseia níveis, fila, custos, recursos.
+    // Retorna { levels, queue, costs, resources, storage, queueMax, isPremium, csrf }
+    async fetchMainBuilding(villageId) {
+      const url = `/game.php?village=${villageId}&screen=main`;
+      const html = await fetch(url, { credentials: 'include' }).then(r => r.text());
+      return parseMainBuilding(html, villageId);
+    },
+
+    // Dispara POST de upgrade de edifício.
+    // buildingKey: key interna do TW (ex: 'main', 'barracks').
+    // Retorna resposta JSON do jogo (ou lança em erro).
+    async submitBuild(villageId, buildingKey, csrfH) {
+      const url = `/game.php?village=${villageId}&screen=main&ajaxaction=upgrade_building&type=${buildingKey}`;
+      const body = new URLSearchParams();
+      body.append('id', buildingKey);
+      body.append('force', '1');
+      body.append('destroy', '0');
+      body.append('source', String(villageId));
+      body.append('h', csrfH);
+      const res = await fetch(url, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'TribalWars-Ajax': '1',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: body.toString(),
+      });
+      const data = await res.json().catch(() => null);
+      if (data?.error?.length) throw new Error(data.error.join('; '));
+      return data || { ok: true };
+    },
+
     // Lê todas as tropas das aldeias (paginado), usando overview_villages?mode=units.
     // groupId: 0 = Todos, >0 = grupo específico.
     // Retorna Map<villageId, { spear, sword, axe, archer, spy, light, marcher, heavy, ram, catapult, knight, snob, militia }>
@@ -1205,6 +1672,104 @@
     return out;
   }
 
+  // Parsea screen=main de uma aldeia.
+  // Retorna:
+  //   levels   — Map<buildingKey, currentLevel>
+  //   queue    — Array<buildingKey> (itens na fila, na ordem)
+  //   costs    — Map<buildingKey, { wood, stone, iron, buildable }>
+  //   resources — { wood, stone, iron }
+  //   storage  — capacidade máxima do armazém (limita construção)
+  //   pop      — { current, max }
+  //   queueMax — slots max da fila (2 = gratuito, 5 = premium)
+  //   isPremium — bool
+  //   csrf     — string (h= do link de upgrade, ou game_data.csrf)
+  function parseMainBuilding(html, _villageId) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+
+    // Níveis atuais: cada linha da tabela tem id="main_buildrow_<key>"
+    const levels = new Map();
+    doc.querySelectorAll('tr[id^="main_buildrow_"]').forEach(tr => {
+      const key = tr.id.replace('main_buildrow_', '');
+      // O nível aparece em formato "Nível N" — captura o número
+      const txt = tr.textContent || '';
+      const m = txt.match(/N[íi]vel\s+(\d+)/i);
+      levels.set(key, m ? parseInt(m[1], 10) : 0);
+    });
+
+    // Custos e se é construível: link de upgrade tem data-building e os TDs têm data-cost
+    const costs = new Map();
+    doc.querySelectorAll('a[data-building]').forEach(a => {
+      const key = a.getAttribute('data-building');
+      if (!key) return;
+      const row = a.closest('tr');
+      if (!row) return;
+      const w = parseInt(row.querySelector('td.cost_wood')?.getAttribute('data-cost') || '0', 10);
+      const s = parseInt(row.querySelector('td.cost_stone')?.getAttribute('data-cost') || '0', 10);
+      const i = parseInt(row.querySelector('td.cost_iron')?.getAttribute('data-cost') || '0', 10);
+      // Se o link existe e não está dentro de um elemento "disabled", é construível
+      const buildable = !a.closest('.inactive') && !a.classList.contains('inactive');
+      costs.set(key, { wood: w, stone: s, iron: i, buildable });
+    });
+
+    // Fila de construção: tbody#buildqueue, cada tr tem classe "buildorder_<key>"
+    const queue = [];
+    const tbody = doc.querySelector('tbody#buildqueue');
+    if (tbody) {
+      tbody.querySelectorAll('tr').forEach(tr => {
+        const cls = [...tr.classList].find(c => c.startsWith('buildorder_'));
+        if (cls) queue.push(cls.replace('buildorder_', ''));
+      });
+    }
+
+    // Recursos atuais
+    const wood    = parseInt(doc.querySelector('#wood')?.textContent?.replace(/\./g, '') || '0', 10);
+    const stone   = parseInt(doc.querySelector('#stone')?.textContent?.replace(/\./g, '') || '0', 10);
+    const iron    = parseInt(doc.querySelector('#iron')?.textContent?.replace(/\./g, '') || '0', 10);
+    const storage = parseInt(doc.querySelector('#storage')?.textContent?.replace(/\./g, '') || '0', 10);
+
+    // Capacidade de pop
+    const popCur = parseInt(doc.querySelector('#pop_current_label')?.textContent?.replace(/\./g, '') || '0', 10);
+    const popMax = parseInt(doc.querySelector('#pop_max_label')?.textContent?.replace(/\./g, '') || '0', 10);
+
+    // Detecção premium: conta slots de fila renderizados.
+    // O jogo renderiza 1 linha vazia por slot livre + linhas de itens na fila.
+    // Premium = 5 slots, free = 2.
+    const queueSlots = tbody
+      ? tbody.querySelectorAll('tr').length
+      : queue.length;
+    // Estimativa conservadora: se tiver mais de 2 slots totais (ocupados+vazios), é premium.
+    // O TW renderiza todos os slots mesmo os vazios (como linha com classe vazia ou placeholder).
+    // Fallback: se não conseguimos medir, assume free (2).
+    let queueMax = 2;
+    // Alternativa: ler data-attr do container da fila, se disponível.
+    const queueContainer = doc.querySelector('#build_queue');
+    if (queueContainer) {
+      const maxAttr = queueContainer.getAttribute('data-max-queue');
+      if (maxAttr) queueMax = parseInt(maxAttr, 10);
+      else queueMax = queueSlots > 2 ? 5 : 2;
+    } else {
+      queueMax = queueSlots > 2 ? 5 : 2;
+    }
+    const isPremium = queueMax >= 5;
+
+    // CSRF do link de upgrade (ou fallback pra game_data.csrf)
+    const upgradeHref = doc.querySelector('a[href*="ajaxaction=upgrade_building"], a[href*="action=upgrade_building"]')?.getAttribute('href') || '';
+    const csrfM = upgradeHref.match(/[?&]h=([a-f0-9]+)/i);
+    const csrf = csrfM?.[1] || (typeof unsafeWindow !== 'undefined' ? unsafeWindow.game_data?.csrf : '') || '';
+
+    return {
+      levels,
+      queue,
+      costs,
+      resources: { wood, stone, iron },
+      storage,
+      pop: { current: popCur, max: popMax },
+      queueMax,
+      isPremium,
+      csrf,
+    };
+  }
+
   // Parser do XML do mundo (unit_info + config) → { unitSpeed, speedFactor, unitSpeedFactor }
   function parseWorldConfig(unitsXml, worldXml) {
     const result = {
@@ -1419,6 +1984,85 @@
     return 0;
   }
 
+  // ---------- builder template decoder ----------
+  // Formato (best-effort, validado com `bgAA...` MAX ARMAZÉM):
+  //   byte 0:           0x6e (magic)
+  //   bytes 1-2:        0x00 0x00 (header)
+  //   pares (2 bytes):  (0x01, building_id) — cada par = "+1 nível pro edifício"
+  //                     repete até encontrar 0x00 0x00 (terminator)
+  //   trailer:          0xf4 0x80 0x80 0x80 + nome em UTF-8
+  //                     + 0xf4 0x80 0x80 0x80 + checksum byte (ignorado)
+  function decodeBuildSequence(b64) {
+    if (typeof b64 !== 'string') return null;
+    const cleaned = b64.trim().replace(/\s+/g, '');
+    if (!cleaned) return null;
+    let bytes;
+    try {
+      const bin = atob(cleaned);
+      bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    } catch {
+      return null;
+    }
+    if (bytes.length < 5 || bytes[0] !== 0x6e || bytes[1] !== 0x00 || bytes[2] !== 0x00) {
+      return null;
+    }
+
+    const steps = [];
+    let i = 3;
+    while (i + 1 < bytes.length) {
+      const a = bytes[i];
+      const b = bytes[i + 1];
+      // Terminator do bloco de pares
+      if (a === 0x00 && b === 0x00) { i += 2; break; }
+      // Cada par válido começa com 0x01 (instrução "+1 nível")
+      if (a !== 0x01) break;
+      const key = BUILDING_KEYS[b];
+      if (!key) {
+        // Building id desconhecido — preserva como `unknown_<id>` pra debug
+        steps.push(`unknown_${b}`);
+      } else {
+        steps.push(key);
+      }
+      i += 2;
+    }
+
+    let name = '';
+    // Procura marcador 0xf4 0x80 0x80 0x80 que cerca o nome
+    const nameStart = findNameMarker(bytes, i);
+    if (nameStart !== -1) {
+      const nameEnd = findNameMarker(bytes, nameStart + 4);
+      const end = nameEnd === -1 ? bytes.length : nameEnd;
+      try {
+        name = new TextDecoder('utf-8').decode(bytes.slice(nameStart + 4, end));
+      } catch {
+        name = '';
+      }
+    }
+
+    return { name: name.trim(), steps };
+  }
+
+  function findNameMarker(bytes, start) {
+    for (let i = start; i + 3 < bytes.length; i++) {
+      if (bytes[i] === 0xf4 && bytes[i + 1] === 0x80 && bytes[i + 2] === 0x80 && bytes[i + 3] === 0x80) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  // Agrupa runs consecutivos do mesmo edifício pra display compacto
+  function encodeBuildSequenceCompact(steps) {
+    const runs = [];
+    for (const s of steps) {
+      const last = runs[runs.length - 1];
+      if (last && last.building === s) last.count++;
+      else runs.push({ building: s, count: 1 });
+    }
+    return runs;
+  }
+
   // ---------- recruiter engine ----------
   function pushLog(msg) {
     const ts = new Date().toLocaleTimeString('pt-BR');
@@ -1531,6 +2175,8 @@
         const td = await Game.fetchTrainData(v.id);
         const recruit = computeRecruitForVillage(profile, td);
         if (Object.keys(recruit).length > 0) {
+          // gap humano entre "ler a fila do quartel" e "clicar recrutar".
+          await sleep(randomInRange(400, 1500));
           const result = await Game.submitRecruit(v.id, recruit);
           const ok = result && (result.error == null);
           if (ok) {
@@ -1570,6 +2216,9 @@
 
   // ---------- scheduler ----------
   const profileTimers = new Map();
+  // serializa ciclos concorrentes — se múltiplos profiles vencem ao mesmo tempo,
+  // o segundo espera o primeiro terminar em vez de paralelizar requests.
+  let recruiterCycleInFlight = null;
 
   function nextDelayMs(profile) {
     const min = Math.max(1, profile.intervalMin);
@@ -1591,7 +2240,18 @@
       const fresh = state.recruiter.profiles.find(p => p.id === profile.id);
       if (!fresh) return;
       if (state.enabled && fresh.enabled) {
-        await runProfileCycle(fresh);
+        // while em vez de if: se outro profile pega o lock entre o nosso await
+        // e a leitura seguinte, esperamos esse novo também antes de prosseguir.
+        while (recruiterCycleInFlight) {
+          try { await recruiterCycleInFlight; } catch (_) {}
+        }
+        if (state.enabled && fresh.enabled) {
+          recruiterCycleInFlight = (async () => {
+            try { await runProfileCycle(fresh); }
+            finally { recruiterCycleInFlight = null; }
+          })();
+          try { await recruiterCycleInFlight; } catch (_) {}
+        }
         scheduleProfileNext(fresh);
       }
     }, delay);
@@ -1615,12 +2275,21 @@
   }
 
   function startGlobal() {
-    // reativar limpa flag de captcha — usuário voltou a logar e quer rodar de novo
-    if (state.captchaTrippedAt > 0) {
+    // reativar limpa flag de captcha — usuário voltou a logar e quer rodar de novo.
+    // Também zera a flag global cross-tab pra todas as abas saírem do modo trippado.
+    // Entra em carência pra evitar re-trip imediato se o hCaptcha residual ainda
+    // estiver no DOM da tela.
+    const wasTripped = state.captchaTrippedAt > 0 || readGlobalTrip();
+    if (wasTripped) {
       state.captchaTrippedAt = 0;
+      clearGlobalTrip();
+      if (captchaChannel) {
+        try { captchaChannel.postMessage({ type: 'REACTIVATE', ts: Date.now(), sourceTab: TAB_ID }); } catch {}
+      }
       const banner = document.getElementById('mog-captcha-banner');
       if (banner) banner.remove();
-      pushLog('Flag de captcha limpa — bot reativado.');
+      enterGracePeriod();
+      pushLog('Flag de captcha limpa — bot reativado (carência de 60s).');
     }
     state.enabled = true;
     persist();
@@ -1669,15 +2338,12 @@
       await sleep(120);
     }
     if (rttSamples.length < 3) return null;
-    rttSamples.sort((a, b) => a - b);
-    const rttMid = rttSamples.slice(1, -1);
-    const avgRtt = rttMid.reduce((s, x) => s + x, 0) / rttMid.length;
-    let avgOffset = 0;
-    if (offsetSamples.length >= 3) {
-      offsetSamples.sort((a, b) => a - b);
-      const offMid = offsetSamples.slice(1, -1);
-      avgOffset = offMid.reduce((s, x) => s + x, 0) / offMid.length;
-    }
+    const median = arr => {
+      const s = [...arr].sort((a, b) => a - b);
+      return s[Math.floor(s.length / 2)];
+    };
+    const avgRtt = median(rttSamples);
+    const avgOffset = offsetSamples.length >= 3 ? median(offsetSamples) : 0;
     return { avgRtt: Math.round(avgRtt), avgOffset: Math.round(avgOffset) };
   }
 
@@ -1712,12 +2378,12 @@
     return Date.now() + (state.scheduler.latency.avgOffset || 0);
   }
 
-  // tempo de antecipação: enviamos esse tanto antes do horário-alvo.
-  // Combina RTT cheio (rede + servidor) com um buffer extra ajustável (default 300ms).
+  // Tempo de antecipação: disparamos RTT/2 antes do executeAt pra o POST chegar ao servidor
+  // exatamente em executeAt (request viaja só uma direção).
   function latencyCompensation() {
     const lat = state.scheduler.latency;
     if (lat.manualOverride > 0) return lat.manualOverride;
-    return Math.max(0, Math.round(lat.avgRtt + (lat.extraBuffer ?? 300)));
+    return Math.max(1, Math.round((lat.avgRtt || 0) * 0.5));
   }
 
   // ticker de 5s: re-mede latência (não roda se há override manual)
@@ -1726,17 +2392,24 @@
     refreshLatency();
   }, 5 * 1000);
 
-  // pré-aquece a conexão TCP fazendo um HEAD curto antes do envio real
-  function warmupConnection() {
-    try { fetch('/game.php?screen=overview', { method: 'HEAD', credentials: 'include' }); } catch {}
+  // pré-aquece TCP/TLS e o handler do servidor antes do envio real.
+  // Quando passamos villageId, fazemos GET no screen=place da origem (mesmo handler do POST → cache quente).
+  // Sem villageId, cai no overview (warmup genérico).
+  function warmupConnection(villageId) {
+    const url = villageId
+      ? `/game.php?village=${villageId}&screen=place`
+      : '/game.php?screen=overview';
+    try { fetch(url, { credentials: 'include' }); } catch {}
   }
 
   // ---------- scheduler de comandos (Agendador) ----------
   const commandTimers = new Map();           // id → fire setTimeout
   const prepareTimers = new Map();           // id → prepare setTimeout
+  const remeasureTimers = new Map();         // id → re-medição de latência setTimeout (T-30s)
   const preparedBundles = new Map();         // bundleLeadId → { hiddenFields, preparedAt }
   const MAX_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;   // 7 dias
   const PREPARE_LEAD_MS = 10 * 1000;         // pré-confirma 10s antes do executeAt
+  const REMEASURE_LEAD_MS = 30 * 1000;       // re-mede latência 30s antes do executeAt
 
   // Acha todos os comandos do mesmo batch (mesma origem→alvo no mesmo "envio").
   // Critério: mesma sourceEntryId + mesmo targetCoords. O 1º (commandIndexInSource=0) é o lead.
@@ -1755,6 +2428,7 @@
   function scheduleCommand(cmd) {
     clearTimeout(commandTimers.get(cmd.id));
     clearTimeout(prepareTimers.get(cmd.id));
+    clearTimeout(remeasureTimers.get(cmd.id));
 
     // Só agendamos o "lead" do batch (commandIndexInSource = 0). Os demais
     // ficam com status 'bundled' — vão junto no mesmo POST.
@@ -1789,6 +2463,14 @@
 
     cmd.status = 'scheduled';
 
+    // PASSO 0 (re-medição de latência): 30s antes do fire, mede latência fresca em background.
+    // Em prepareForFire (T-10s) só LEMOS o resultado, sem await — orçamento de 10s fica livre pro POST de confirm.
+    const remeasureDelay = Math.max(0, fireDelay - REMEASURE_LEAD_MS);
+    const remT = setTimeout(() => {
+      if (state.scheduler.latency.manualOverride === 0) refreshLatency();
+    }, remeasureDelay);
+    remeasureTimers.set(cmd.id, remT);
+
     // PASSO 1 (pré-confirmação): roda 10s antes do fire (ou agora se já está dentro da janela)
     const prepareDelay = Math.max(0, fireDelay - PREPARE_LEAD_MS);
     const prepT = setTimeout(() => prepareForFire(cmd), prepareDelay);
@@ -1805,11 +2487,9 @@
     // se já foi cancelado/abortado, não faz nada
     if (!['scheduled', 'pending'].includes(cmd.status)) return;
 
-    // re-mede latência ANTES do prepare. O prepare pega o RTT real do
-    // momento e ajusta a compensação aplicada lá no setTimeout do fire.
+    // Re-cálculo do fireDelay com a latência mais recente (já refrescada pelo remeasureTimer em T-30s).
+    // Sem await aqui — o orçamento de 10s vai inteiro pro POST de confirm.
     if (state.scheduler.latency.manualOverride === 0) {
-      await refreshLatency();
-      // re-agenda o fire com a compensação atualizada
       const compensation = latencyCompensation();
       const localExecuteAt = serverToLocalTs(cmd.executeAt);
       const newFireDelay = localExecuteAt - Date.now() - compensation;
@@ -1838,6 +2518,7 @@
       // pré-confirm falhou → cancela o fire e marca tudo como falha
       clearTimeout(commandTimers.get(cmd.id));
       commandTimers.delete(cmd.id);
+      remeasureTimers.delete(cmd.id);
       bundle.forEach(s => {
         s.status = 'failed_request';
         s.lastError = `preparação falhou: ${e.message}`;
@@ -1850,6 +2531,7 @@
 
   async function executeCommand(cmd) {
     commandTimers.delete(cmd.id);
+    remeasureTimers.delete(cmd.id);
     // se ainda está em 'confirming' (passo 1 não terminou), espera curto
     // até passar a 'scheduled' (sucesso) ou outro estado terminal
     let waitedMs = 0;
@@ -1877,12 +2559,15 @@
     const driftBeforeWarmup = warmupAt - Date.now();
     if (driftBeforeWarmup > 0 && driftBeforeWarmup < 5000) {
       await sleep(driftBeforeWarmup);
-      warmupConnection();   // não aguarda — só mantém o socket quente
+      warmupConnection(cmd.sourceVillageId);   // GET no screen=place da origem (mesmo handler do POST)
     }
 
-    // drift correction final
+    // drift correction final em duas etapas: sleep grosso + busy-wait fino dos últimos 15ms.
+    // setTimeout/sleep tem precisão ~4ms+ e atrasa sob carga; busy-wait com performance.now() é exato.
     const drift = target - Date.now();
-    if (drift > 0 && drift < 1000) await sleep(drift);
+    if (drift > 15 && drift < 1000) await sleep(drift - 15);
+    const tHigh = performance.now() + Math.max(0, target - Date.now());
+    while (performance.now() < tHigh) { /* spin curto até o instante exato */ }
 
     try {
       const res = await Game.confirmCommand({
@@ -1894,9 +2579,12 @@
       });
       bundle.forEach(s => { s.status = 'sent'; s.serverResponse = res; });
       const skew = serverNow() - cmd.executeAt;
+      const finalDrift = target - Date.now();
       const lat = state.scheduler.latency;
+      const oneWay = Math.round((lat.avgRtt || 0) * 0.5);
+      const skewSign = skew >= 0 ? '+' : '';
       const totalAttacks = bundle.length;
-      pushSchedulerLog(`enviado: ${cmd.sourceCoords} → ${cmd.targetCoords} (${cmd.type}, ${totalAttacks} ataque${totalAttacks > 1 ? 's' : ''}) · skew ${skew}ms · rtt=${lat.avgRtt} comp=${compensation}`);
+      pushSchedulerLog(`enviado: ${cmd.sourceCoords} → ${cmd.targetCoords} (${cmd.type}, ${totalAttacks} ataque${totalAttacks > 1 ? 's' : ''}) · skew=${skewSign}${skew} rtt=${lat.avgRtt} oneWay=${oneWay} comp=${compensation} drift=${finalDrift}`);
     } catch (e) {
       bundle.forEach(s => { s.status = 'failed_request'; s.lastError = e.message; });
       pushSchedulerLog(`FALHA: ${cmd.sourceCoords} → ${cmd.targetCoords}: ${e.message}`);
@@ -2409,6 +3097,61 @@
     }
     .mog-prow.mog-prow-expanded .mog-prow-expand { display: block; }
     .mog-prow.mog-prow-expanded .mog-prow-main { border-radius: 10px 10px 0 0; }
+
+    /* ======= BUILDER (Construtor) ======= */
+    .mog-grid-head.mog-grid-builder,
+    .mog-prow-main.mog-prow-builder {
+      grid-template-columns: 36px minmax(120px, 1fr) minmax(110px, 0.9fr) minmax(160px, 1.4fr) minmax(110px, 0.7fr) minmax(86px, 0.7fr) 88px;
+    }
+    .mog-builder-adv {
+      grid-template-columns: minmax(220px, 0.5fr) minmax(0, 2fr) !important;
+    }
+    .mog-bgroup-wide { grid-column: span 1; }
+    .mog-template-preview {
+      font-size: 13px; line-height: 1.9;
+      color: #cfd0d0; word-wrap: break-word;
+      padding: 4px 0;
+    }
+    .mog-tpl-run {
+      display: inline-block; padding: 2px 6px; margin: 1px;
+      background: #232424; border-radius: 4px;
+      font-size: 12px;
+    }
+    .mog-tpl-more { color: ${COLOR_ACCENT}; font-weight: 600; }
+    .mog-import-block {
+      background: #181919; border: 1px solid #232424;
+      border-radius: 8px; padding: 14px; margin-bottom: 14px;
+    }
+    .mog-import-block textarea {
+      width: 100%; box-sizing: border-box;
+      background: #0f1010; border: 1px solid #2a2b2b;
+      color: #d8d8d8; border-radius: 6px; padding: 8px;
+      font-family: monospace; font-size: 11.5px;
+      resize: vertical; min-height: 50px;
+    }
+    .mog-import-msg { font-size: 12px; color: #6b6b6b; align-self: center; }
+    .mog-import-msg.mog-import-err { color: #ff6044; }
+    .mog-templates-list { display: flex; flex-direction: column; gap: 8px; }
+    .mog-tpl-row {
+      background: #181919; border: 1px solid #232424;
+      border-radius: 8px; padding: 10px 14px;
+    }
+    .mog-tpl-head {
+      display: grid; grid-template-columns: minmax(150px, 1fr) auto 80px;
+      gap: 10px; align-items: center;
+    }
+    .mog-tpl-meta { font-size: 11px; color: #6b6b6b; text-align: right; }
+    .mog-tpl-preview { margin-top: 8px; }
+    .mog-btn-on {
+      background: ${COLOR_ACCENT} !important;
+      color: #fff !important;
+      border-color: ${COLOR_ACCENT} !important;
+    }
+    .mog-label {
+      display: block; font-size: 11px; font-weight: 700;
+      text-transform: uppercase; color: #888; letter-spacing: 0.4px;
+      margin-bottom: 6px;
+    }
 
     .mog-bgroups { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
     .mog-bgroup {
@@ -3507,10 +4250,10 @@
           <span>Gerente de Conta</span>
         </div>
         <div class="mog-side-items">
-          <div class="mog-side-item mog-side-disabled" data-section="builder">
+          <div class="mog-side-item" data-section="builder">
             <span class="mog-side-icon">🏗</span>
             <span>Construtor</span>
-            <span class="mog-side-badge">Em breve</span>
+            <span class="mog-side-status" data-status-for="builder"></span>
           </div>
           <div class="mog-side-item mog-side-active" data-section="recruiter">
             <span class="mog-side-icon">⚔</span>
@@ -3687,6 +4430,7 @@
   panel.querySelector('#mog-log-clear').addEventListener('click', () => {
     if (state.ui.activeSection === 'scheduler' || state.ui.activeSection === 'dashboard') state.scheduler.log = [];
     else if (state.ui.activeSection === 'farmer' || state.ui.activeSection === 'defenses') state.farmer.log = [];
+    else if (state.ui.activeSection === 'builder') state.builder.log = [];
     else state.recruiter.log = [];
     persist();
     renderLog();
@@ -3706,6 +4450,8 @@
       renderFarmer();
     } else if (state.ui.activeSection === 'defenses') {
       renderDefenses();
+    } else if (state.ui.activeSection === 'builder') {
+      renderBuilder();
     } else {
       renderPlaceholder(state.ui.activeSection);
     }
@@ -3721,6 +4467,7 @@
   function refreshSidebarStatus() {
     const recruiterOn = state.enabled && state.recruiter.profiles.some(p => p.enabled);
     const farmerOn = !!state.farmer.enabled;
+    const builderOn = !!state.builder?.enabled && (state.builder.profiles || []).some(p => p.enabled);
     const hasScheduledCmd = state.scheduler.operations.some(op =>
       Array.isArray(op.commands) && op.commands.some(c =>
         c.status === 'scheduled' || c.status === 'confirming' || c.status === 'sending' || c.status === 'bundled' || c.status === 'pending'
@@ -3729,6 +4476,7 @@
     const map = {
       recruiter: recruiterOn,
       farmer: farmerOn,
+      builder: builderOn,
       scheduler: hasScheduledCmd,
       dashboard: hasScheduledCmd,
     };
@@ -4619,7 +5367,7 @@
           const travel = travelTimeMs(cand.entry.village, slot.target, slowest);
           const executeAt = slot.arrivalAt - travel + (baseMs + k * 100);
           if (executeAt - now < -2000) {
-            lastReason = `aldeia ${cand.entry.village.x}|${cand.entry.village.y}: viagem ${Math.round(travel / 60000)}min, sairia ${Math.round((now - executeAt) / 1000)}s no passado`;
+            lastReason = 'não há tempo suficiente';
             waveOk = false; break;
           }
           resolvedWaves.push({ units: r.units, slowest, travel, ms: baseMs + k * 100, executeAt });
@@ -5019,8 +5767,10 @@
       if (['pending', 'scheduled', 'confirming', 'bundled'].includes(s.status)) {
         clearTimeout(commandTimers.get(s.id));
         clearTimeout(prepareTimers.get(s.id));
+        clearTimeout(remeasureTimers.get(s.id));
         commandTimers.delete(s.id);
         prepareTimers.delete(s.id);
+        remeasureTimers.delete(s.id);
         preparedBundles.delete(s.id);
         s.status = 'aborted';
       }
@@ -5097,7 +5847,7 @@
       if (lat.manualOverride > 0) {
         lat.manualOverride = 0;
       } else {
-        lat.manualOverride = Math.max(1, lat.avgRtt + (lat.extraBuffer ?? 300));
+        lat.manualOverride = Math.max(1, Math.round(lat.avgRtt * 0.5));
       }
       persist();
       renderDashboard();
@@ -5380,14 +6130,15 @@
             <input class="mog-input" type="number" min="0" id="mog-farm-arrival-window" value="${f.arrivalWindowMin}">
             <span class="mog-farm-suffix">min</span>
           </div>
-          <div class="mog-farm-config-row">
+          <div class="mog-farm-config-row" title="Raio máximo (em campos) entre origem e bárbara no ciclo. Bárbaras fora do alcance de qualquer origem são puladas. 0 = sem limite.">
+            <label>Raio máx farm</label>
+            <input class="mog-input" type="number" min="0" max="50" id="mog-farm-max-radius" value="${f.maxFarmRadius}">
+            <span class="mog-farm-suffix">campos</span>
+          </div>
+          <div class="mog-farm-config-row" title="Raio máximo (em campos) usado pelo botão 'Buscar bárbaras' pra descobrir bárbaras novas no mapa.">
             <label>Raio busca</label>
             <input class="mog-input" type="number" min="1" max="50" id="mog-farm-radius" value="${f.searchRadius}">
             <span class="mog-farm-suffix">campos</span>
-          </div>
-          <div class="mog-farm-config-row mog-farm-safemode" title="Quando ativo, só farma bárbaras com último relatório de espionagem dentro de 24h confirmando que estão limpas (sem muralha, sem tropa). Bárbaras sem relatório são espionadas antes e farmadas no próximo ciclo.">
-            <label>Modo seguro</label>
-            <button class="mog-toggle ${f.safeMode ? 'mog-on' : ''}" id="mog-farm-safemode" style="margin-left: auto;">${f.safeMode ? 'Ativo' : 'Desligado'}</button>
           </div>
         </div>
       </div>
@@ -5549,18 +6300,6 @@
         persist();
       });
     }
-    const safeBtn = root.querySelector('#mog-farm-safemode');
-    if (safeBtn) {
-      safeBtn.addEventListener('click', () => {
-        state.farmer.safeMode = !state.farmer.safeMode;
-        persist();
-        safeBtn.classList.toggle('mog-on', state.farmer.safeMode);
-        safeBtn.textContent = state.farmer.safeMode ? 'Ativo' : 'Desligado';
-        pushFarmerLog(state.farmer.safeMode
-          ? 'Modo seguro ativado: só farma bárbaras com relatório limpo recente.'
-          : 'Modo seguro desligado: farma todas (risco de perdas).');
-      });
-    }
     const runBtn = root.querySelector('#mog-farm-run-now');
     if (runBtn) {
       runBtn.addEventListener('click', () => {
@@ -5573,6 +6312,14 @@
       radiusInp.addEventListener('input', e => {
         const v = parseInt(e.target.value, 10);
         state.farmer.searchRadius = isNaN(v) || v < 1 ? 1 : Math.min(50, v);
+        persist();
+      });
+    }
+    const maxRadiusInp = root.querySelector('#mog-farm-max-radius');
+    if (maxRadiusInp) {
+      maxRadiusInp.addEventListener('input', e => {
+        const v = parseInt(e.target.value, 10);
+        state.farmer.maxFarmRadius = isNaN(v) || v < 0 ? 0 : Math.min(50, v);
         persist();
       });
     }
@@ -5702,7 +6449,7 @@
   // ---------- threats (defesas detectadas via espionagem) ----------
 
   const THREAT_TTL_MS = 24 * 60 * 60 * 1000;     // 24h: depois libera farm de novo
-  const THREAT_REFRESH_MS = 5 * 60 * 1000;       // 5min: cache curto pra não re-fetar mesma bárbara em ciclos próximos
+  const THREAT_REFRESH_MS = 30 * 60 * 1000;      // 30min: cache longo reduz refetch quando o usuário aciona refresh manual em sequência
 
   function getThreat(villageId) {
     return state.farmer.threats.find(t => t.villageId === villageId);
@@ -5712,14 +6459,6 @@
     if (!t) return false;
     if (Date.now() - (t.scoutedAt || 0) > THREAT_TTL_MS) return false;
     return (t.wall >= 1) || (t.totalUnits > 0) || (t.totalAway > 0);
-  }
-
-  // Bárbara é "segura pra farmar" SE tem threat dentro do TTL com tudo zerado.
-  // Sem threat ou threat vencido → NÃO é segura (precisa reespionar antes).
-  function isThreatSafe(t) {
-    if (!t) return false;
-    if (Date.now() - (t.scoutedAt || 0) > THREAT_TTL_MS) return false;
-    return (t.wall || 0) === 0 && (t.totalUnits || 0) === 0 && (t.totalAway || 0) === 0;
   }
 
   function upsertThreat(entry) {
@@ -5767,8 +6506,8 @@
       } catch (e) {
         // erro lendo um relatório não bloqueia o resto
       }
-      // pequeno delay pra não estressar o servidor
-      await sleep(150);
+      // delay aleatório entre fetches pra evitar burst regular (sinal claro de bot → captcha)
+      await sleep(randomInRange(400, 900));
     }
     if (updated > 0 || skipped > 0) {
       persist();
@@ -5938,13 +6677,6 @@
         return false;
       };
 
-      // 3b. atualiza relatórios de espionagem (defesa/muralha) — cache curto evita re-fetch
-      try {
-        await refreshThreats(list);
-      } catch (e) {
-        pushFarmerLog('Aviso: falha ao atualizar relatórios: ' + e.message);
-      }
-
       // helpers consolidados sobre outgoingAttacks. Estrutura: Map<coord, {count, arrivals: ms[]}>
       const attacksGoingTo = (coords) => outgoingAttacks.get(coords)?.count || 0;
       const arrivalsAt = (coords) => outgoingAttacks.get(coords)?.arrivals || [];
@@ -5954,61 +6686,90 @@
         return Math.max(0, f.maxPerBarbarian - going - sentThisCycle);
       };
 
-      // 3c. modo seguro: bárbaras sem threat seguro (sem espionagem ou vencida)
-      // são espionadas ANTES do dispatch. Próximo ciclo farma com confiança.
-      // Excluí: bárbaras com defesa detectada, com slots cheios, ou já com
-      // threat seguro recente.
-      if (f.safeMode) {
-        const needScout = list.filter(t => {
-          if (t.hadLosses) return false;
-          if (slotsAvailable(t) <= 0) return false;     // já tem ataques suficientes indo
-          const th = getThreat(t.villageId);
-          if (isThreatActive(th)) return false;
-          if (isThreatSafe(th)) return false;
-          return true;
-        });
-        if (needScout.length > 0) {
-          pushFarmerLog(`Modo seguro: espionando ${needScout.length} bárbara(s) sem dados.`);
-          updateFarmerProgress(0, needScout.length);
-          try {
-            await scoutBarbarians(needScout, {
-              logPrefix: 'espia',
-              onProgress: (current, total) => updateFarmerProgress(current, total),
-            });
-          } catch (e) {
-            pushFarmerLog('Falha ao espionar: ' + e.message);
-          }
-          updateFarmerProgress(0, 0);
-        }
-      }
-
-      // 4. pré-calcula upper bound de envios. Bárbara é elegível se:
+      // 4. pré-calcula upper bound realista. Bárbara é elegível se:
       //   - não tem perdas
       //   - tem ao menos 1 slot livre (going + sent < maxPerBarbarian)
-      //   - sem defesa detectada
-      //   - safeMode → tem threat seguro recente
+      //   - sem defesa detectada via espionagem manual antiga
+      // Pra `planned`, simula pareamento sem mutar tropa real (clone das tropas)
+      // pra refletir o que realmente vai ser enviado, não um teto otimista.
+      // Janela temporal não é simulada (precisaria ETA por par origem×alvo).
       const eligible = list.filter(t => {
         if (t.hadLosses) return false;
         if (slotsAvailable(t) <= 0) return false;
         const th = getThreat(t.villageId);
         if (isThreatActive(th)) return false;
-        if (f.safeMode && !isThreatSafe(th)) return false;
         return true;
       });
-      const skippedFull = list.filter(t => !t.hadLosses && slotsAvailable(t) <= 0).length;
-      const skippedDefended = list.filter(t => !t.hadLosses && slotsAvailable(t) > 0 && isThreatActive(getThreat(t.villageId))).length;
-      const skippedNoScout = f.safeMode
-        ? list.filter(t => !t.hadLosses && slotsAvailable(t) > 0 && !isThreatActive(getThreat(t.villageId)) && !isThreatSafe(getThreat(t.villageId))).length
-        : 0;
-      // soma slots livres por bárbara elegível (não só count*1)
-      const totalSlots = eligible.reduce((acc, t) => acc + slotsAvailable(t), 0);
-      const planned = Math.min(totalSlots, eligible.length * origins.length);
-      const extras = [];
-      if (skippedFull > 0) extras.push(`${skippedFull} já com ataques suficientes`);
-      if (skippedDefended > 0) extras.push(`${skippedDefended} c/ defesa detectada`);
-      if (skippedNoScout > 0) extras.push(`${skippedNoScout} aguardando relatório`);
-      const extra = extras.length ? `, ${extras.join(', ')}` : '';
-      pushFarmerLog(`${origins.length} origem(ns), ${list.length} bárbara(s)${extra}, ~${planned} envio(s) planejado(s).`);
+
+      const simUnits = new Map();
+      for (const o of origins) {
+        simUnits.set(o.id, { ...(unitsByVillage.get(String(o.id)) || {}) });
+      }
+      const simHasTroops = (originId, tpl) => {
+        const u = simUnits.get(originId);
+        if (!u) return false;
+        for (const [unitId, qty] of Object.entries(tpl.units || {})) {
+          if (qty > 0 && (u[unitId] || 0) < qty) return false;
+        }
+        return true;
+      };
+      const simSubtract = (originId, tpl) => {
+        const u = simUnits.get(originId);
+        for (const [unitId, qty] of Object.entries(tpl.units || {})) {
+          if (qty > 0) u[unitId] = Math.max(0, (u[unitId] || 0) - qty);
+        }
+      };
+      // mesma regra de raio + janela temporal do loop real, pra `planned`
+      // bater com `dispatched`. Simula chegadas acumulando ETAs por bárbara.
+      const simMaxRadius = f.maxFarmRadius || 0;
+      const simInRange = (origin, target) => {
+        if (simMaxRadius === 0) return true;
+        return distance({ x: origin.x, y: origin.y }, { x: target.x, y: target.y }) <= simMaxRadius;
+      };
+      const simArrivals = new Map();
+      for (const [coord, entry] of outgoingAttacks) {
+        simArrivals.set(coord, [...(entry.arrivals || [])]);
+      }
+      const simViolatesWindow = (coords, eta) => {
+        if (!eta || arrivalWindowMs === 0) return false;
+        const list = simArrivals.get(coords) || [];
+        for (const x of list) {
+          if (Math.abs(x - eta) < arrivalWindowMs) return true;
+        }
+        return false;
+      };
+      const findSimOrigin = (target, tpl) => {
+        for (const o of origins) {
+          if (!simInRange(o, target)) continue;
+          if (!simHasTroops(o.id, tpl)) continue;
+          const eta = etaFor(o, target, tpl);
+          if (simViolatesWindow(target.coords, eta)) continue;
+          return { origin: o, eta };
+        }
+        return null;
+      };
+      let planned = 0;
+      for (const t of eligible) {
+        let slots = slotsAvailable(t);
+        while (slots > 0) {
+          let tpl = t.fullLoot ? tplB : tplA;
+          let pick = findSimOrigin(t, tpl);
+          if (!pick && tpl === tplB) {
+            tpl = tplA;
+            pick = findSimOrigin(t, tpl);
+          }
+          if (!pick) break;
+          simSubtract(pick.origin.id, tpl);
+          if (pick.eta) {
+            const arr = simArrivals.get(t.coords) || [];
+            arr.push(pick.eta);
+            simArrivals.set(t.coords, arr);
+          }
+          planned++;
+          slots--;
+        }
+      }
+      pushFarmerLog(`${origins.length} origem(ns), ${list.length} bárbara(s), ${planned} envio(s) planejado(s).`);
       updateFarmerProgress(0, planned);
 
       // 5. contadores locais de quantos farms já mandamos pra cada bárbara neste ciclo
@@ -6016,56 +6777,59 @@
       const wallBreakSet = new Set(state.farmer.needsWallBreak.map(w => `${w.x}|${w.y}`));
       let processed = 0;
 
-      // 6. pra cada origem, itera bárbaras
-      for (const origin of origins) {
+      // helper: escolhe a origem mais próxima viável (com tropa pro template,
+      // dentro do raio máximo e sem violar a janela temporal). Retorna null se
+      // nenhuma serve. maxFarmRadius=0 significa sem limite.
+      const maxRadius = f.maxFarmRadius || 0;
+      const pickBestOrigin = (target, tpl) => {
+        const candidates = origins
+          .filter(o => hasTroopsFor(o.id, tpl))
+          .map(o => ({ o, dist: distance({ x: o.x, y: o.y }, { x: target.x, y: target.y }) }))
+          .filter(c => maxRadius === 0 || c.dist <= maxRadius)
+          .filter(c => !violatesArrivalWindow(target, etaFor(c.o, target, tpl)))
+          .sort((a, b) => a.dist - b.dist);
+        return candidates[0]?.o || null;
+      };
+
+      // 6. para cada bárbara, encontra a melhor origem viável e dispara.
+      // Loop invertido (bárbaras × origens): se origem mais próxima esgotar tropa,
+      // tenta a próxima — bárbaras só são abandonadas quando NENHUMA origem serve.
+      for (const target of list) {
         if (!manual && !state.farmer.enabled) break;
 
-        for (const target of list) {
+        // bárbaras com perdas vão pra wall-break, não dispara
+        if (target.hadLosses) {
+          if (!wallBreakSet.has(target.coords)) {
+            state.farmer.needsWallBreak.push({ x: target.x, y: target.y, lastAttempt: Date.now() });
+            wallBreakSet.add(target.coords);
+            persist();
+            pushFarmerLog(`Aldeia ${target.coords} marcada pra quebra-muralha.`);
+          }
+          skipped++;
+          continue;
+        }
+
+        // pula se threat ativo (defesa detectada via espionagem manual)
+        const th = getThreat(target.villageId);
+        if (isThreatActive(th)) continue;
+
+        // tenta preencher cada slot disponível dessa bárbara
+        let slots = slotsAvailable(target, sentCount.get(target.villageId) || 0);
+        while (slots > 0) {
           if (!manual && !state.farmer.enabled) break;
-          const sentThisCycle = sentCount.get(target.villageId) || 0;
-          // checa slots: quantos farms ainda cabem (já indo + já enviados < max)
-          if (slotsAvailable(target, sentThisCycle) <= 0) continue;
-          // pula bárbaras com defesa detectada (muralha ≥1 ou tropa)
-          const th = getThreat(target.villageId);
-          if (isThreatActive(th)) continue;
-          // modo seguro: só farma com threat seguro recente; sem isso, pula
-          if (f.safeMode && !isThreatSafe(th)) continue;
 
-          let tplToUse = tplA;
-          let label = 'A';
-          if (target.hadLosses) {
-            // perdas → registra na lista de wall-break, não dispara
-            label = 'spy';
-            if (!wallBreakSet.has(target.coords)) {
-              state.farmer.needsWallBreak.push({ x: target.x, y: target.y, lastAttempt: Date.now() });
-              wallBreakSet.add(target.coords);
-              persist();
-              pushFarmerLog(`Aldeia ${target.coords} marcada pra quebra-muralha.`);
-            }
-            skipped++;
-            continue;
-          } else if (target.fullLoot) {
-            tplToUse = tplB;
-            label = 'B';
+          let tplToUse = target.fullLoot ? tplB : tplA;
+          let label = target.fullLoot ? 'B' : 'A';
+
+          let origin = pickBestOrigin(target, tplToUse);
+          // downgrade pragmático: B sem origem viável → tenta A
+          if (!origin && tplToUse === tplB) {
+            tplToUse = tplA;
+            label = 'A↓';
+            origin = pickBestOrigin(target, tplToUse);
           }
-
-          // simulação de tropa: se origem não tem o template,
-          // pula sem chamar API. Se for o template B e ela tem A, usa A
-          // (downgrade pragmático — saque cheio mas sem tropas pra B).
-          if (!hasTroopsFor(origin.id, tplToUse)) {
-            if (tplToUse === tplB && hasTroopsFor(origin.id, tplA)) {
-              tplToUse = tplA;
-              label = 'A↓';     // marca downgrade de B pra A
-            } else {
-              // sem tropa nem pra A → próxima origem
-              break;
-            }
-          }
-
-          // janela temporal: estima ETA do farm e bloqueia se chegar muito perto
-          // de outra chegada. Evita 2 farms na mesma bárbara em janela < arrivalWindowMin.
-          const eta = etaFor(origin, target, tplToUse);
-          if (violatesArrivalWindow(target, eta)) continue;
+          // nenhuma origem viável → abandona essa bárbara
+          if (!origin) break;
 
           try {
             await Game.dispatchFarm({
@@ -6075,8 +6839,9 @@
               csrf,
             });
             subtractTroopsFor(origin.id, tplToUse);
-            sentCount.set(target.villageId, sentThisCycle + 1);
-            // registra ETA no map de chegadas pra próximas iterações respeitarem
+            const sentThisCycle = (sentCount.get(target.villageId) || 0) + 1;
+            sentCount.set(target.villageId, sentThisCycle);
+            const eta = etaFor(origin, target, tplToUse);
             if (eta) {
               const entry = outgoingAttacks.get(target.coords) || { count: 0, arrivals: [] };
               entry.count += 1;
@@ -6087,16 +6852,19 @@
             processed++;
             updateFarmerProgress(processed, planned);
             pushFarmerLog(`[${processed}/${planned}] farm ${label}: ${origin.name} → ${target.coords}`);
+            slots = slotsAvailable(target, sentThisCycle);
           } catch (e) {
             failed++;
             const msg = e.message || String(e);
-            // tropa insuficiente que escapou da simulação: zera tropas e abandona origem
             if (/insuficiente|tropas|unit|not enough/i.test(msg)) {
+              // origem mentiu sobre ter tropa (race com algo que mexeu na aldeia):
+              // zera local e tenta outra origem pro mesmo slot
               originUnits.set(origin.id, {});
-              pushFarmerLog(`sem tropas em ${origin.name}, próxima origem.`);
-              break;
+              pushFarmerLog(`sem tropas em ${origin.name}, tentando outra origem.`);
+              continue;
             }
             pushFarmerLog(`falha: ${origin.name} → ${target.coords}: ${msg}`);
+            break;
           }
 
           // jitter realista entre envios
@@ -6251,13 +7019,6 @@
       ]);
       const knownIds = new Set(known.map(b => b.villageId));
 
-      // garante que threats das conhecidas estão atualizadas (cache evita re-fetch)
-      try {
-        await refreshThreats(known);
-      } catch (e) {
-        pushFarmerLog('Aviso: falha ao atualizar relatórios: ' + e.message);
-      }
-
       // mapa do mundo (cacheado)
       let world;
       try {
@@ -6266,7 +7027,9 @@
         throw new Error('falha ao carregar mapa: ' + e.message);
       }
 
-      // candidatas tipo 1: bárbaras NOVAS no raio, não conhecidas, sem ataque indo
+      // candidatas: bárbaras NOVAS no raio, não conhecidas no AS, sem ataque indo.
+      // outgoing é Map<coord, {count, arrivals}> — usar .has() em vez de comparar
+      // o objeto com 0 (bug antigo: o filtro nunca disparava).
       const candidates = new Map();
       let skippedOutgoing = 0;
       for (const v of world) {
@@ -6275,7 +7038,7 @@
         const coords = `${v.x}|${v.y}`;
         for (const origin of origins) {
           if (distanceFields(origin.x, origin.y, v.x, v.y) <= f.searchRadius) {
-            if ((outgoing.get(coords) || 0) > 0) {
+            if (outgoing.has(coords)) {
               skippedOutgoing++;
               break;
             }
@@ -6285,23 +7048,9 @@
         }
       }
 
-      // candidatas tipo 2: bárbaras CONHECIDAS sem threat ativo nem seguro
-      // (sem espionagem, ou relatório vencido). Habilita o farmer a farmá-las
-      // com confiança no próximo ciclo.
-      let knownNeedingScout = 0;
-      for (const b of known) {
-        if ((outgoing.get(b.coords) || 0) > 0) continue;
-        const th = getThreat(b.villageId);
-        if (isThreatActive(th) || isThreatSafe(th)) continue;
-        if (candidates.has(b.villageId)) continue;
-        candidates.set(b.villageId, { villageId: b.villageId, x: b.x, y: b.y, coords: b.coords });
-        knownNeedingScout++;
-      }
-
       const candList = [...candidates.values()];
       const parts = [];
       if (skippedOutgoing > 0) parts.push(`${skippedOutgoing} pulada(s) c/ ataque a caminho`);
-      if (knownNeedingScout > 0) parts.push(`${knownNeedingScout} conhecida(s) sem relatório`);
       const extra = parts.length ? ` (${parts.join(', ')})` : '';
       pushFarmerLog(`${candList.length} bárbara(s) pra espionar${extra}.`);
       if (candList.length === 0) return;
@@ -6745,10 +7494,623 @@
     ).join('');
   }
 
+  // ============================================================
+  // BUILDER (Construtor) — UI + stubs do motor
+  // ============================================================
+
+  function pushBuilderLog(msg) {
+    const ts = new Date().toLocaleTimeString('pt-BR');
+    state.builder.log = state.builder.log || [];
+    state.builder.log.unshift(`[${ts}] ${msg}`);
+    state.builder.log = state.builder.log.slice(0, 200);
+    if (state.ui.activeSection === 'builder') renderLog();
+  }
+
+  // Stubs de scheduler — cada profile tem seu timer. Implementação cheia
+  // (ciclo + Game.fetchMainBuilding) chega na Fase 4.
+  const builderTimers = new Map();
+
+  function nextBuilderDelayMs(profile) {
+    const min = Math.max(1, profile.intervalMin || 5);
+    const max = Math.max(min, profile.intervalMax || 7);
+    return (min + Math.random() * (max - min)) * 60 * 1000;
+  }
+
+  function scheduleBuilderProfileNext(profile) {
+    const old = builderTimers.get(profile.id);
+    if (old) clearTimeout(old);
+    if (!state.builder.enabled || !profile.enabled) {
+      profile.nextRunAt = 0;
+      builderTimers.delete(profile.id);
+      return;
+    }
+    const delay = nextBuilderDelayMs(profile);
+    profile.nextRunAt = Date.now() + delay;
+    persist();
+    const tid = setTimeout(() => {
+      runBuilderProfileCycle(profile).finally(() => {
+        if (state.builder.enabled && profile.enabled) scheduleBuilderProfileNext(profile);
+      });
+    }, delay);
+    builderTimers.set(profile.id, tid);
+  }
+
+  function startBuilderProfile(p) {
+    p.enabled = true;
+    persist();
+    pushBuilderLog(`▶ "${p.name}" ativado`);
+    if (state.builder.enabled) scheduleBuilderProfileNext(p);
+  }
+
+  function stopBuilderProfile(p) {
+    p.enabled = false;
+    p.nextRunAt = 0;
+    const tid = builderTimers.get(p.id);
+    if (tid) clearTimeout(tid);
+    builderTimers.delete(p.id);
+    persist();
+    pushBuilderLog(`⏸ "${p.name}" pausado`);
+  }
+
+  function startBuilder() {
+    state.builder.enabled = true;
+    persist();
+    pushBuilderLog('🟢 Construtor ligado');
+    state.builder.profiles.forEach(p => {
+      if (p.enabled) scheduleBuilderProfileNext(p);
+    });
+  }
+
+  function stopBuilder() {
+    state.builder.enabled = false;
+    builderTimers.forEach(t => clearTimeout(t));
+    builderTimers.clear();
+    state.builder.profiles.forEach(p => { p.nextRunAt = 0; p.running = null; });
+    persist();
+    pushBuilderLog('🔴 Construtor desligado');
+  }
+
+  function recoverBuilderSchedule() {
+    if (!state.builder.enabled) return;
+    state.builder.profiles.forEach(p => {
+      if (p.enabled) scheduleBuilderProfileNext(p);
+    });
+  }
+
+  // Calcula qual é o próximo edifício a construir para uma aldeia.
+  // Algoritmo de alvo cumulativo: percorre template.steps na ordem e, para cada
+  // posição i, conta quantas vezes o edifício steps[i] já apareceu até ali (= nível
+  // alvo acumulado). Se level_atual[b] + queued[b] < alvo_cumulativo, retorna steps[i].
+  // Tolerante a builds manuais que já ultrapassaram o alvo.
+  // Retorna string (buildingKey) ou null se template completo.
+  function computeNextBuildStep(template, levels, queue) {
+    if (!template?.steps?.length) return null;
+
+    // queuedDelta: quantas construções de cada key estão pendentes na fila atual
+    const queuedDelta = {};
+    for (const key of queue) queuedDelta[key] = (queuedDelta[key] || 0) + 1;
+
+    // alvo cumulativo até a posição i (exclusive) para cada key
+    const cumulTarget = {};
+
+    for (const key of template.steps) {
+      cumulTarget[key] = (cumulTarget[key] || 0) + 1;
+      const current = levels.get(key) || 0;
+      const queued  = queuedDelta[key] || 0;
+      if (current + queued < cumulTarget[key]) return key;
+    }
+    return null; // template completo
+  }
+
+  // Ciclo real do Construtor. Percorre as aldeias do grupo e, para cada uma,
+  // lê screen=main, decide o próximo passo e dispara o upgrade se possível.
+  async function runBuilderProfileCycle(profile, opts = {}) {
+    const manual = opts.manual === true;
+
+    if (state.builder.busy && !manual) {
+      pushBuilderLog(`⚠ "${profile.name}" — ciclo anterior ainda em execução, pulando.`);
+      return;
+    }
+
+    const template = state.builder.templates.find(t => t.id === profile.templateId);
+    if (!template) {
+      pushBuilderLog(`⚠ "${profile.name}" — nenhum modelo vinculado.`);
+      return;
+    }
+
+    state.builder.busy = true;
+    profile.running = Date.now();
+    persist();
+
+    let villages;
+    try {
+      villages = await Game.fetchGroupVillages(profile.groupId);
+    } catch (e) {
+      pushBuilderLog(`✗ "${profile.name}" — erro ao buscar aldeias: ${e.message}`);
+      state.builder.busy = false;
+      profile.running = null;
+      persist();
+      return;
+    }
+
+    if (!villages.length) {
+      pushBuilderLog(`⚠ "${profile.name}" — grupo sem aldeias.`);
+      state.builder.busy = false;
+      profile.running = null;
+      persist();
+      return;
+    }
+
+    let built = 0;
+    let skipped = 0;
+
+    try {
+      for (let vi = 0; vi < villages.length; vi++) {
+        if (!state.builder.enabled && !manual) break;
+
+        const v = villages[vi];
+        if (vi > 0) await sleep(humanLikeDelay());
+
+        let mainData;
+        try {
+          mainData = await Game.fetchMainBuilding(v.id);
+        } catch (e) {
+          pushBuilderLog(`✗ ${v.name} — erro ao ler edifícios: ${e.message}`);
+          skipped++;
+          continue;
+        }
+
+        const { levels, queue, costs, resources, storage, queueMax, isPremium, csrf } = mainData;
+
+        // Atualiza detecção premium (primeira aldeia válida define o cache)
+        if (state.builder.premiumDetected === null) {
+          state.builder.premiumDetected = isPremium;
+        }
+
+        const effectiveCap = Math.min(profile.parallelQueue, queueMax);
+
+        if (queue.length >= effectiveCap) {
+          skipped++;
+          continue;
+        }
+
+        const key = computeNextBuildStep(template, levels, queue);
+
+        if (!key) {
+          pushBuilderLog(`✓ ${v.name} — template completo.`);
+          skipped++;
+          continue;
+        }
+
+        const cost = costs.get(key);
+
+        // Edifício não aparece na página (premium-only ou não disponível)
+        if (!cost) {
+          pushBuilderLog(`⚠ ${v.name} — "${key}" não disponível nesta aldeia (pulando step).`);
+          skipped++;
+          continue;
+        }
+
+        if (!cost.buildable) {
+          pushBuilderLog(`⚠ ${v.name} — "${key}" não construível agora (nível máx ou bloqueado).`);
+          skipped++;
+          continue;
+        }
+
+        // Verifica recursos
+        if (resources.wood < cost.wood || resources.stone < cost.stone || resources.iron < cost.iron) {
+          const need = `M:${cost.wood} A:${cost.stone} F:${cost.iron}`;
+          const have = `M:${resources.wood} A:${resources.stone} F:${resources.iron}`;
+          pushBuilderLog(`⚠ ${v.name} — recursos insuficientes para ${key}. Precisa: ${need}. Tem: ${have}`);
+          skipped++;
+          continue;
+        }
+
+        // Verifica se o armazém cabe (storage < custo = construção impossível até aumentar armazém)
+        if (storage < cost.wood || storage < cost.stone || storage < cost.iron) {
+          pushBuilderLog(`⚠ ${v.name} — armazém muito pequeno para ${key} (cap:${storage}).`);
+          skipped++;
+          continue;
+        }
+
+        // Dispara o upgrade
+        try {
+          await Game.submitBuild(v.id, key, csrf);
+          const disp = BUILDING_DISPLAY[key]?.label || key;
+          pushBuilderLog(`🔨 ${v.name} — construindo ${disp} (nível ${(levels.get(key) || 0) + 1 + queue.filter(q => q === key).length})`);
+          built++;
+        } catch (e) {
+          pushBuilderLog(`✗ ${v.name} — falha ao construir ${key}: ${e.message}`);
+          skipped++;
+        }
+      }
+    } finally {
+      state.builder.busy = false;
+      profile.running = null;
+      persist();
+    }
+
+    if (built || skipped) {
+      pushBuilderLog(`📊 "${profile.name}" — ${built} construção(ões) enfileirada(s), ${skipped} aldeia(s) pulada(s).`);
+    }
+  }
+
+  // ---- render: lista de profiles ----
+  function renderBuilder() {
+    if (state.builder.ui.view === 'templates') return renderBuilderTemplates();
+
+    const profiles = state.builder.profiles;
+    const moduleOn = !!state.builder.enabled;
+    const activeCount = profiles.filter(p => p.enabled).length;
+
+    const headHtml = `
+      <div class="mog-section-head">
+        <div>
+          <h2>🏗 Construtor</h2>
+          <p>${profiles.length} modelo(s) · ${activeCount} ativo(s)</p>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <button class="mog-btn mog-btn-ghost" id="mog-builder-templates">📚 Modelos</button>
+          <button class="mog-add-btn" id="mog-builder-add">+ Novo modelo</button>
+          <button class="mog-btn ${moduleOn ? 'mog-btn-on' : ''}" id="mog-builder-toggle"
+                  title="${moduleOn ? 'Desligar Construtor' : 'Ligar Construtor'}">
+            ${moduleOn ? '● ON' : '○ OFF'}
+          </button>
+        </div>
+      </div>
+    `;
+
+    if (!profiles.length) {
+      content.innerHTML = headHtml + `
+        <div class="mog-empty">
+          Nenhum modelo criado. Importe primeiro uma <strong style="color:${COLOR_ACCENT}">📚 Sequência de construção</strong>,
+          depois clique em <strong style="color:${COLOR_ACCENT}">+ Novo modelo</strong>.
+        </div>
+      `;
+      bindBuilderTopButtons();
+      return;
+    }
+
+    if (!state.builder.templates.length) {
+      content.innerHTML = headHtml + `
+        <div class="mog-empty">
+          Nenhuma sequência importada ainda. Acesse <strong style="color:${COLOR_ACCENT}">📚 Modelos</strong> para importar.
+        </div>
+      `;
+      bindBuilderTopButtons();
+      return;
+    }
+
+    const gridHead = `
+      <div class="mog-grid-head mog-grid-builder">
+        <div></div>
+        <div class="mog-h-name">Modelo</div>
+        <div>Grupo</div>
+        <div>Sequência</div>
+        <div>Intervalo (min)</div>
+        <div>Status</div>
+        <div></div>
+      </div>
+    `;
+
+    const rowsHtml = profiles.map(p => renderBuilderProfileRow(p)).join('');
+    content.innerHTML = headHtml + gridHead + rowsHtml;
+    bindBuilderTopButtons();
+    profiles.forEach(p => bindBuilderProfileRow(p));
+    profiles.forEach(p => populateBuilderGroupSelect(p));
+  }
+
+  function bindBuilderTopButtons() {
+    content.querySelector('#mog-builder-add')?.addEventListener('click', addBuilderProfile);
+    content.querySelector('#mog-builder-templates')?.addEventListener('click', () => {
+      state.builder.ui.view = 'templates';
+      persist();
+      renderContent();
+    });
+    content.querySelector('#mog-builder-toggle')?.addEventListener('click', () => {
+      if (state.builder.enabled) stopBuilder();
+      else startBuilder();
+      renderContent();
+    });
+  }
+
+  function addBuilderProfile() {
+    const tplId = state.builder.templates[0]?.id || null;
+    const p = makeBuildProfile({
+      name: `Modelo #${state.builder.profiles.length + 1}`,
+      templateId: tplId,
+    });
+    state.builder.profiles.push(p);
+    state.builder.ui.expandedProfileId = p.id;
+    persist();
+    renderContent();
+  }
+
+  function builderProfileStatusLabel(p) {
+    if (p.running) return `Executando ${p.running.processed}/${p.running.total}`;
+    if (!p.enabled) return 'Pausado';
+    if (!state.builder.enabled) return 'Aguardando';
+    if (p.nextRunAt) {
+      const t = new Date(p.nextRunAt);
+      return 'Próx. ' + t.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+    }
+    return 'Ativo';
+  }
+
+  function renderBuilderProfileRow(p) {
+    const expanded = state.builder.ui.expandedProfileId === p.id;
+    const tpl = state.builder.templates.find(t => t.id === p.templateId);
+    const tplLabel = tpl ? `${escapeHtml(tpl.name)} (${tpl.steps.length})` : '— sem modelo —';
+    return `
+      <div class="mog-prow ${p.enabled ? 'mog-prow-on' : ''} ${expanded ? 'mog-prow-expanded' : ''}" data-pid="${p.id}">
+        <div class="mog-prow-main mog-prow-builder">
+          <div class="mog-tg" data-act="toggle" title="${p.enabled ? 'Desativar' : 'Ativar'}"></div>
+          <input class="mog-pname" data-act="rename" value="${escapeHtml(p.name)}">
+          <select class="mog-select" data-act="group"></select>
+          <select class="mog-select" data-act="template" title="${escapeHtml(tplLabel)}">
+            ${state.builder.templates.map(t =>
+              `<option value="${t.id}" ${t.id === p.templateId ? 'selected' : ''}>${escapeHtml(t.name)} (${t.steps.length})</option>`
+            ).join('')}
+          </select>
+          <div class="mog-interval">
+            <input class="mog-input" type="number" min="1" data-act="intmin" value="${p.intervalMin}">
+            <span>–</span>
+            <input class="mog-input" type="number" min="1" data-act="intmax" value="${p.intervalMax}">
+          </div>
+          <div class="mog-status-cell ${p.enabled && state.builder.enabled ? 'mog-status-active' : ''}" data-act="status-cell">
+            ${builderProfileStatusLabel(p)}
+          </div>
+          <div class="mog-prow-actions">
+            <button class="mog-iconbtn" data-act="expand" title="${expanded ? 'Recolher' : 'Configurar'}">⚙</button>
+            <button class="mog-iconbtn mog-iconbtn-danger" data-act="delete" title="Excluir">×</button>
+          </div>
+        </div>
+        <div class="mog-prow-expand">
+          ${renderBuilderAdvanced(p)}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderBuilderAdvanced(p) {
+    const tpl = state.builder.templates.find(t => t.id === p.templateId);
+    const preview = tpl
+      ? renderTemplateSequencePreview(tpl, 18)
+      : '<em style="opacity:.6">Selecione um modelo acima.</em>';
+    return `
+      <div class="mog-bgroups mog-builder-adv">
+        <div class="mog-bgroup">
+          <div class="mog-bgroup-title">Filas paralelas no edifício principal</div>
+          <div class="mog-bgroup-fields">
+            <div class="mog-bunit-cell">
+              <label>Vagas simultâneas</label>
+              <input type="number" min="1" max="5" data-act="parallel" value="${p.parallelQueue}"
+                     title="2 = conta sem premium · 5 = conta premium. Detectado automaticamente no 1º ciclo.">
+            </div>
+          </div>
+        </div>
+        <div class="mog-bgroup mog-bgroup-wide">
+          <div class="mog-bgroup-title">Sequência do modelo${tpl ? ` (${tpl.steps.length} níveis)` : ''}</div>
+          <div class="mog-template-preview">${preview}</div>
+        </div>
+      </div>
+      <div class="mog-prow-tools">
+        <button class="mog-btn mog-btn-ghost" data-act="run-now">Executar agora</button>
+      </div>
+    `;
+  }
+
+  function renderTemplateSequencePreview(tpl, limit) {
+    const runs = encodeBuildSequenceCompact(tpl.steps);
+    const shown = typeof limit === 'number' ? runs.slice(0, limit) : runs;
+    const html = shown.map(r => {
+      const meta = BUILDING_DISPLAY[r.building] || { label: r.building, icon: '❓' };
+      return `<span class="mog-tpl-run" title="${escapeHtml(meta.label)}">${meta.icon}×${r.count}</span>`;
+    }).join(' → ');
+    const overflow = (typeof limit === 'number' && runs.length > limit)
+      ? ` <span class="mog-tpl-more">… +${runs.length - limit}</span>`
+      : '';
+    return html + overflow;
+  }
+
+  function bindBuilderProfileRow(p) {
+    const row = content.querySelector(`.mog-prow[data-pid="${p.id}"]`);
+    if (!row) return;
+
+    row.querySelector('[data-act="toggle"]').addEventListener('click', () => {
+      if (p.enabled) stopBuilderProfile(p);
+      else startBuilderProfile(p);
+      renderContent();
+    });
+
+    row.querySelector('[data-act="rename"]').addEventListener('change', e => {
+      p.name = e.target.value.trim() || 'Sem nome';
+      persist();
+    });
+
+    row.querySelector('[data-act="group"]').addEventListener('change', e => {
+      p.groupId = parseInt(e.target.value, 10) || 0;
+      persist();
+    });
+
+    row.querySelector('[data-act="template"]').addEventListener('change', e => {
+      p.templateId = e.target.value || null;
+      persist();
+      renderContent();
+    });
+
+    row.querySelector('[data-act="intmin"]').addEventListener('change', e => {
+      p.intervalMin = Math.max(1, parseInt(e.target.value, 10) || 1);
+      persist();
+    });
+    row.querySelector('[data-act="intmax"]').addEventListener('change', e => {
+      p.intervalMax = Math.max(1, parseInt(e.target.value, 10) || 1);
+      persist();
+    });
+
+    row.querySelector('[data-act="expand"]').addEventListener('click', () => {
+      state.builder.ui.expandedProfileId = state.builder.ui.expandedProfileId === p.id ? null : p.id;
+      persist();
+      renderContent();
+    });
+
+    row.querySelector('[data-act="delete"]').addEventListener('click', () => {
+      if (!confirm(`Excluir o modelo "${p.name}"?`)) return;
+      if (p.enabled) stopBuilderProfile(p);
+      state.builder.profiles = state.builder.profiles.filter(x => x.id !== p.id);
+      if (state.builder.ui.expandedProfileId === p.id) state.builder.ui.expandedProfileId = null;
+      persist();
+      renderContent();
+    });
+
+    const parallel = row.querySelector('[data-act="parallel"]');
+    if (parallel) {
+      parallel.addEventListener('change', e => {
+        const v = parseInt(e.target.value, 10) || 2;
+        p.parallelQueue = Math.min(5, Math.max(1, v));
+        e.target.value = p.parallelQueue;
+        persist();
+      });
+    }
+
+    const runBtn = row.querySelector('[data-act="run-now"]');
+    if (runBtn) runBtn.addEventListener('click', () => runBuilderProfileCycle(p, { manual: true }));
+  }
+
+  async function populateBuilderGroupSelect(p) {
+    const sel = content.querySelector(`.mog-prow[data-pid="${p.id}"] [data-act="group"]`);
+    if (!sel) return;
+    sel.innerHTML = `<option>Carregando...</option>`;
+    const groups = await getGroups();
+    sel.innerHTML = groups.map(g =>
+      `<option value="${g.id}" ${g.id === p.groupId ? 'selected' : ''}>${escapeHtml(g.name)}</option>`
+    ).join('');
+  }
+
+  // ---- render: gerenciamento de templates ----
+  function renderBuilderTemplates() {
+    const templates = state.builder.templates;
+    const headHtml = `
+      <div class="mog-section-head">
+        <div>
+          <button class="mog-btn mog-btn-ghost" id="mog-builder-back">← Voltar</button>
+          <h2 style="display:inline-block; margin-left:12px;">📚 Modelos de construção</h2>
+          <p>${templates.length} modelo(s) salvos</p>
+        </div>
+      </div>
+    `;
+
+    const importBlock = `
+      <div class="mog-import-block">
+        <label class="mog-label">Importar nova sequência</label>
+        <textarea id="mog-builder-import" rows="3"
+                  placeholder="Cole aqui a sequência (ex: bgAAAQAB...)"></textarea>
+        <div style="display:flex; gap:8px; margin-top:6px;">
+          <button class="mog-btn" id="mog-builder-import-btn">Importar</button>
+          <span id="mog-builder-import-msg" class="mog-import-msg"></span>
+        </div>
+      </div>
+    `;
+
+    const listHtml = templates.length
+      ? templates.map(t => renderBuilderTemplateRow(t)).join('')
+      : `<div class="mog-empty">Nenhum modelo salvo. Cole uma sequência acima e clique em Importar.</div>`;
+
+    content.innerHTML = headHtml + importBlock + `<div class="mog-templates-list">${listHtml}</div>`;
+    bindBuilderTemplates();
+  }
+
+  function renderBuilderTemplateRow(tpl) {
+    const expanded = state.builder.ui.expandedTemplateId === tpl.id;
+    const created = new Date(tpl.createdAt).toLocaleDateString('pt-BR');
+    const preview = renderTemplateSequencePreview(tpl, expanded ? null : 12);
+    return `
+      <div class="mog-tpl-row ${expanded ? 'mog-tpl-expanded' : ''}" data-tid="${tpl.id}">
+        <div class="mog-tpl-head">
+          <input class="mog-pname" data-act="tpl-rename" value="${escapeHtml(tpl.name)}">
+          <span class="mog-tpl-meta">${tpl.steps.length} níveis · importado em ${created}</span>
+          <div class="mog-prow-actions">
+            <button class="mog-iconbtn" data-act="tpl-toggle" title="${expanded ? 'Recolher' : 'Ver sequência completa'}">${expanded ? '▴' : '▾'}</button>
+            <button class="mog-iconbtn mog-iconbtn-danger" data-act="tpl-delete" title="Excluir">×</button>
+          </div>
+        </div>
+        <div class="mog-tpl-preview">${preview}</div>
+      </div>
+    `;
+  }
+
+  function bindBuilderTemplates() {
+    content.querySelector('#mog-builder-back')?.addEventListener('click', () => {
+      state.builder.ui.view = 'profiles';
+      persist();
+      renderContent();
+    });
+
+    const importBtn = content.querySelector('#mog-builder-import-btn');
+    const ta = content.querySelector('#mog-builder-import');
+    const msg = content.querySelector('#mog-builder-import-msg');
+    importBtn?.addEventListener('click', () => {
+      const raw = ta.value.trim();
+      if (!raw) { msg.textContent = 'Cole uma sequência primeiro.'; msg.className = 'mog-import-msg mog-import-err'; return; }
+      const decoded = decodeBuildSequence(raw);
+      if (!decoded || !decoded.steps.length) {
+        msg.textContent = 'Formato inválido — verifique se copiou a string completa.';
+        msg.className = 'mog-import-msg mog-import-err';
+        return;
+      }
+      const name = ensureUniqueTemplateName(decoded.name || 'Sem nome');
+      const tpl = makeBuildTemplate({ name, raw, steps: decoded.steps });
+      state.builder.templates.push(tpl);
+      state.builder.ui.expandedTemplateId = tpl.id;
+      persist();
+      pushBuilderLog(`📚 Modelo importado: "${tpl.name}" (${tpl.steps.length} níveis)`);
+      renderContent();
+    });
+
+    content.querySelectorAll('.mog-tpl-row').forEach(row => {
+      const tid = row.getAttribute('data-tid');
+      const tpl = state.builder.templates.find(t => t.id === tid);
+      if (!tpl) return;
+
+      row.querySelector('[data-act="tpl-rename"]').addEventListener('change', e => {
+        tpl.name = e.target.value.trim() || 'Sem nome';
+        persist();
+      });
+
+      row.querySelector('[data-act="tpl-toggle"]').addEventListener('click', () => {
+        state.builder.ui.expandedTemplateId = state.builder.ui.expandedTemplateId === tid ? null : tid;
+        persist();
+        renderContent();
+      });
+
+      row.querySelector('[data-act="tpl-delete"]').addEventListener('click', () => {
+        const linkedProfiles = state.builder.profiles.filter(p => p.templateId === tid);
+        const warn = linkedProfiles.length
+          ? `\n\nAtenção: ${linkedProfiles.length} modelo(s) usam essa sequência e ficarão sem template.`
+          : '';
+        if (!confirm(`Excluir "${tpl.name}"?${warn}`)) return;
+        state.builder.templates = state.builder.templates.filter(t => t.id !== tid);
+        linkedProfiles.forEach(p => { p.templateId = null; });
+        if (state.builder.ui.expandedTemplateId === tid) state.builder.ui.expandedTemplateId = null;
+        persist();
+        renderContent();
+      });
+    });
+  }
+
+  function ensureUniqueTemplateName(base) {
+    const existing = new Set(state.builder.templates.map(t => t.name));
+    if (!existing.has(base)) return base;
+    let i = 2;
+    while (existing.has(`${base} (${i})`)) i++;
+    return `${base} (${i})`;
+  }
+
   // ---- log render ----
   function getActiveLog() {
     if (state.ui.activeSection === 'scheduler' || state.ui.activeSection === 'dashboard') return state.scheduler.log;
     if (state.ui.activeSection === 'farmer' || state.ui.activeSection === 'defenses') return state.farmer.log;
+    if (state.ui.activeSection === 'builder') return state.builder.log;
     return state.recruiter.log;
   }
 
@@ -6795,4 +8157,7 @@
 
   // farmer: re-agenda timer se enabled antes do reload
   recoverFarmerSchedule();
+
+  // builder: re-agenda profiles habilitados se módulo estava ligado
+  recoverBuilderSchedule();
 })();

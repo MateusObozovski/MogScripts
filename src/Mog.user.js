@@ -601,7 +601,6 @@
       templateId: overrides.templateId || null,
       intervalMin: overrides.intervalMin ?? 5,
       intervalMax: overrides.intervalMax ?? 7,
-      parallelQueue: overrides.parallelQueue ?? 2,
       nextRunAt: overrides.nextRunAt || 0,
       running: null,
     };
@@ -707,6 +706,7 @@
 
   const DEFAULT_LATENCY = {
     avgRtt: 0,         // ms (ida+volta)
+    avgOneWay: 0,      // ms (uplink estimado: rtt - rttBack, derivado do header Date da resposta)
     avgOffset: 0,      // ms (clock diff: servidor − cliente)
     manualOverride: 0, // ms (se >0, usa esse valor, ignora medição auto)
     measuredAt: 0,     // timestamp da última medição
@@ -2318,6 +2318,7 @@
   async function measureLatency() {
     const rttSamples = [];
     const offsetSamples = [];
+    const rttBackSamples = [];   // localReceive - serverDate: estima rttBack + truncamento (~+500ms)
     for (let i = 0; i < 5; i++) {
       try {
         const tStart = Date.now();
@@ -2330,9 +2331,12 @@
         const dateHeader = r.headers.get('Date');
         if (dateHeader) {
           const serverTs = new Date(dateHeader).getTime();
-          // assume que o servidor escreveu Date no meio do RTT
           const localMid = (tStart + tEnd) / 2;
           offsetSamples.push(serverTs - localMid);
+          // rttBack: tempo de descida (servidor→cliente). O header Date reflete quando o servidor
+          // enviou a resposta. rttBack = tEnd - serverTs, mas serverTs é truncado ao segundo,
+          // introduzindo viés de +0..+999ms. A mediana de muitas amostras ≈ rttBack + 500ms.
+          rttBackSamples.push(tEnd - serverTs);
         }
       } catch {}
       await sleep(120);
@@ -2344,7 +2348,16 @@
     };
     const avgRtt = median(rttSamples);
     const avgOffset = offsetSamples.length >= 3 ? median(offsetSamples) : 0;
-    return { avgRtt: Math.round(avgRtt), avgOffset: Math.round(avgOffset) };
+    // oneWay (uplink cliente→servidor) = rtt - rttBack_true.
+    // rttBackSamples = localReceive − serverDate ≈ rttBack_true − avgOffset + Uniform(0,1000).
+    // median ≈ rttBack_true − avgOffset + 500; após −500: rttBack_corr = rttBack_true − avgOffset.
+    // Portanto: rtt − rttBack_corr − avgOffset = rtt − rttBack_true = oneWay. Clamp [1, rtt−1].
+    let avgOneWay = Math.round(avgRtt / 2);  // fallback sem amostras suficientes
+    if (rttBackSamples.length >= 3) {
+      const rttBack = Math.max(1, median(rttBackSamples) - 500);
+      avgOneWay = Math.max(1, Math.min(Math.round(avgRtt) - 1, Math.round(avgRtt - rttBack - avgOffset)));
+    }
+    return { avgRtt: Math.round(avgRtt), avgOffset: Math.round(avgOffset), avgOneWay };
   }
 
   async function refreshLatency() {
@@ -2354,6 +2367,7 @@
       const lat = state.scheduler.latency;
       lat.avgRtt = r.avgRtt;
       lat.avgOffset = r.avgOffset;
+      lat.avgOneWay = r.avgOneWay;
       lat.measuredAt = Date.now();
       lat.samples = (lat.samples || 0) + 1;
       persist();
@@ -2378,12 +2392,15 @@
     return Date.now() + (state.scheduler.latency.avgOffset || 0);
   }
 
-  // Tempo de antecipação: disparamos RTT/2 antes do executeAt pra o POST chegar ao servidor
-  // exatamente em executeAt (request viaja só uma direção).
+  // Tempo de antecipação: disparamos (oneWay − LATE_BIAS_MS) antes do executeAt.
+  // O bias de 25ms garante chegada ~25ms após executeAt — nunca antes.
+  // Preferência do usuário: até +50ms de atraso é aceitável; adiantado não é.
+  const LATE_BIAS_MS = 25;
   function latencyCompensation() {
     const lat = state.scheduler.latency;
     if (lat.manualOverride > 0) return lat.manualOverride;
-    return Math.max(1, Math.round((lat.avgRtt || 0) * 0.5));
+    const oneWay = lat.avgOneWay || Math.round((lat.avgRtt || 0) * 0.5);
+    return Math.max(1, oneWay - LATE_BIAS_MS);
   }
 
   // ticker de 5s: re-mede latência (não roda se há override manual)
@@ -2568,6 +2585,7 @@
     if (drift > 15 && drift < 1000) await sleep(drift - 15);
     const tHigh = performance.now() + Math.max(0, target - Date.now());
     while (performance.now() < tHigh) { /* spin curto até o instante exato */ }
+    const finalDrift = target - Date.now(); // medido ANTES do POST (quanto atrasamos no busy-wait)
 
     try {
       const res = await Game.confirmCommand({
@@ -2579,12 +2597,10 @@
       });
       bundle.forEach(s => { s.status = 'sent'; s.serverResponse = res; });
       const skew = serverNow() - cmd.executeAt;
-      const finalDrift = target - Date.now();
       const lat = state.scheduler.latency;
-      const oneWay = Math.round((lat.avgRtt || 0) * 0.5);
       const skewSign = skew >= 0 ? '+' : '';
       const totalAttacks = bundle.length;
-      pushSchedulerLog(`enviado: ${cmd.sourceCoords} → ${cmd.targetCoords} (${cmd.type}, ${totalAttacks} ataque${totalAttacks > 1 ? 's' : ''}) · skew=${skewSign}${skew} rtt=${lat.avgRtt} oneWay=${oneWay} comp=${compensation} drift=${finalDrift}`);
+      pushSchedulerLog(`enviado: ${cmd.sourceCoords} → ${cmd.targetCoords} (${cmd.type}, ${totalAttacks} ataque${totalAttacks > 1 ? 's' : ''}) · skew=${skewSign}${skew} rtt=${lat.avgRtt} oneWay=${lat.avgOneWay} comp=${compensation} drift=${finalDrift}`);
     } catch (e) {
       bundle.forEach(s => { s.status = 'failed_request'; s.lastError = e.message; });
       pushSchedulerLog(`FALHA: ${cmd.sourceCoords} → ${cmd.targetCoords}: ${e.message}`);
@@ -3103,20 +3119,25 @@
     .mog-prow-main.mog-prow-builder {
       grid-template-columns: 36px minmax(120px, 1fr) minmax(110px, 0.9fr) minmax(160px, 1.4fr) minmax(110px, 0.7fr) minmax(86px, 0.7fr) 88px;
     }
-    .mog-builder-adv {
-      grid-template-columns: minmax(220px, 0.5fr) minmax(0, 2fr) !important;
-    }
+    .mog-builder-adv { grid-template-columns: 1fr !important; }
     .mog-bgroup-wide { grid-column: span 1; }
-    .mog-template-preview {
-      font-size: 13px; line-height: 1.9;
-      color: #cfd0d0; word-wrap: break-word;
-      padding: 4px 0;
+    .mog-template-preview { margin-top: 4px; }
+    .mog-seq-table {
+      width: 100%; border-collapse: collapse;
+      font-size: 12.5px; color: #cfd0d0;
     }
-    .mog-tpl-run {
-      display: inline-block; padding: 2px 6px; margin: 1px;
-      background: #232424; border-radius: 4px;
-      font-size: 12px;
+    .mog-seq-table thead th {
+      text-align: left; padding: 3px 8px;
+      font-size: 11px; font-weight: 700; text-transform: uppercase;
+      color: #888; border-bottom: 1px solid #2a2b2b;
     }
+    .mog-seq-table tbody tr:nth-child(even) { background: #181919; }
+    .mog-seq-table tbody tr:hover { background: #1e1f1f; }
+    .mog-seq-table td { padding: 3px 8px; }
+    .mog-seq-num  { color: #888; font-size: 11px; white-space: nowrap; min-width: 36px; }
+    .mog-seq-icon { font-size: 14px; width: 22px; }
+    .mog-seq-count { color: ${COLOR_ACCENT}; font-weight: 600; text-align: right; }
+    .mog-seq-more  { color: #888; font-size: 11px; padding: 4px 8px; }
     .mog-tpl-more { color: ${COLOR_ACCENT}; font-weight: 600; }
     .mog-import-block {
       background: #181919; border: 1px solid #232424;
@@ -7667,9 +7688,7 @@
           state.builder.premiumDetected = isPremium;
         }
 
-        const effectiveCap = Math.min(profile.parallelQueue, queueMax);
-
-        if (queue.length >= effectiveCap) {
+        if (queue.length >= queueMax) {
           skipped++;
           continue;
         }
@@ -7875,22 +7894,12 @@
   function renderBuilderAdvanced(p) {
     const tpl = state.builder.templates.find(t => t.id === p.templateId);
     const preview = tpl
-      ? renderTemplateSequencePreview(tpl, 18)
+      ? renderTemplateSequencePreview(tpl, 20)
       : '<em style="opacity:.6">Selecione um modelo acima.</em>';
     return `
       <div class="mog-bgroups mog-builder-adv">
-        <div class="mog-bgroup">
-          <div class="mog-bgroup-title">Filas paralelas no edifício principal</div>
-          <div class="mog-bgroup-fields">
-            <div class="mog-bunit-cell">
-              <label>Vagas simultâneas</label>
-              <input type="number" min="1" max="5" data-act="parallel" value="${p.parallelQueue}"
-                     title="2 = conta sem premium · 5 = conta premium. Detectado automaticamente no 1º ciclo.">
-            </div>
-          </div>
-        </div>
         <div class="mog-bgroup mog-bgroup-wide">
-          <div class="mog-bgroup-title">Sequência do modelo${tpl ? ` (${tpl.steps.length} níveis)` : ''}</div>
+          <div class="mog-bgroup-title">Próximos passos do modelo${tpl ? ` — ${tpl.steps.length} níveis no total` : ''}</div>
           <div class="mog-template-preview">${preview}</div>
         </div>
       </div>
@@ -7900,17 +7909,35 @@
     `;
   }
 
+  // Renderiza a sequência de construção como tabela numerada.
+  // limit: máx de linhas mostradas (null = todas). Agrupa runs consecutivos numa única linha.
   function renderTemplateSequencePreview(tpl, limit) {
+    if (!tpl?.steps?.length) return '<em style="opacity:.6">Sem passos.</em>';
     const runs = encodeBuildSequenceCompact(tpl.steps);
-    const shown = typeof limit === 'number' ? runs.slice(0, limit) : runs;
-    const html = shown.map(r => {
+    const shown = (limit != null) ? runs.slice(0, limit) : runs;
+
+    // Calcula o número de passo inicial de cada run para a coluna "#"
+    let stepCursor = 1;
+    const rows = shown.map(r => {
       const meta = BUILDING_DISPLAY[r.building] || { label: r.building, icon: '❓' };
-      return `<span class="mog-tpl-run" title="${escapeHtml(meta.label)}">${meta.icon}×${r.count}</span>`;
-    }).join(' → ');
-    const overflow = (typeof limit === 'number' && runs.length > limit)
-      ? ` <span class="mog-tpl-more">… +${runs.length - limit}</span>`
+      const from = stepCursor;
+      stepCursor += r.count;
+      const range = r.count === 1 ? String(from) : `${from}–${stepCursor - 1}`;
+      return `<tr>
+        <td class="mog-seq-num">${range}</td>
+        <td class="mog-seq-icon">${meta.icon}</td>
+        <td class="mog-seq-label">${escapeHtml(meta.label)}</td>
+        <td class="mog-seq-count">×${r.count}</td>
+      </tr>`;
+    });
+
+    const more = (limit != null && runs.length > limit)
+      ? `<tr><td colspan="4" class="mog-seq-more">… +${runs.length - limit} linha(s)</td></tr>`
       : '';
-    return html + overflow;
+
+    return `<table class="mog-seq-table"><thead>
+      <tr><th>#</th><th></th><th>Edifício</th><th>Qtd</th></tr>
+    </thead><tbody>${rows.join('')}${more}</tbody></table>`;
   }
 
   function bindBuilderProfileRow(p) {
@@ -7963,16 +7990,6 @@
       renderContent();
     });
 
-    const parallel = row.querySelector('[data-act="parallel"]');
-    if (parallel) {
-      parallel.addEventListener('change', e => {
-        const v = parseInt(e.target.value, 10) || 2;
-        p.parallelQueue = Math.min(5, Math.max(1, v));
-        e.target.value = p.parallelQueue;
-        persist();
-      });
-    }
-
     const runBtn = row.querySelector('[data-act="run-now"]');
     if (runBtn) runBtn.addEventListener('click', () => runBuilderProfileCycle(p, { manual: true }));
   }
@@ -8023,14 +8040,14 @@
   function renderBuilderTemplateRow(tpl) {
     const expanded = state.builder.ui.expandedTemplateId === tpl.id;
     const created = new Date(tpl.createdAt).toLocaleDateString('pt-BR');
-    const preview = renderTemplateSequencePreview(tpl, expanded ? null : 12);
+    const preview = renderTemplateSequencePreview(tpl, expanded ? null : 8);
     return `
       <div class="mog-tpl-row ${expanded ? 'mog-tpl-expanded' : ''}" data-tid="${tpl.id}">
         <div class="mog-tpl-head">
           <input class="mog-pname" data-act="tpl-rename" value="${escapeHtml(tpl.name)}">
           <span class="mog-tpl-meta">${tpl.steps.length} níveis · importado em ${created}</span>
           <div class="mog-prow-actions">
-            <button class="mog-iconbtn" data-act="tpl-toggle" title="${expanded ? 'Recolher' : 'Ver sequência completa'}">${expanded ? '▴' : '▾'}</button>
+            <button class="mog-iconbtn" data-act="tpl-toggle" title="${expanded ? 'Recolher' : 'Ver sequência'}">${expanded ? '▴' : '▾'}</button>
             <button class="mog-iconbtn mog-iconbtn-danger" data-act="tpl-delete" title="Excluir">×</button>
           </div>
         </div>

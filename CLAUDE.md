@@ -350,17 +350,113 @@ Pra cada lead command (commandIndexInSource = 0):
 
 ## 8. Em aberto / Roadmap
 
-- **Construtor**: módulo de fila de construção automática.
-- **Pesquisa**: módulo de pesquisa de unidades.
-- **Coleta em massa**: scavenge automatizado.
-- **Quebra de muralha**: módulo separado pra atacar bárbaras na lista `state.farmer.needsWallBreak` com aríetes/catapultas. Por ora o Farmador só **detecta** (`hadLosses`) e marca; não dispara.
-- **Farm de jogadores inativos**: hoje só bárbaras. Pra inativos, vai precisar usar `screen=place` direto (não tem entrada no Assistente nativo).
-- **Spy puro com troca temporária**: hoje, quando bárbara volta com perdas, o ciclo só registra wall-break sem mandar espião. Implementar troca temporária de A pra `{spy:1}` no ciclo (similar à Buscar bárbaras) pra confirmar a defesa antes de marcar.
-- **Cunhagem**: cunhar moedas com estoque mínimo.
-- **Balanceador de Recursos**: redistribuir via mercado.
-- **Configurações**: tema, posição do launcher, etc. (Hoje só tem export/import de configs e re-validar licença.)
-- **Licença — cache offline**: hoje bloqueio é total se servidor está fora do ar. Se Vercel cair, ninguém usa o bot. Considerar cache de last-validated-at com TTL (24h?) pra dar resiliência. Tradeoff: revogação leva mais tempo a propagar.
-- **Licença — admin UI**: hoje é página HTML simples em `/admin` com login por token em sessionStorage. Funcional pra dezenas de usuários. Se virar centenas, paginar `/api/license/list` e adicionar busca.
+Organização da sidebar quando tudo estiver pronto:
+
+```
+Gerente de Conta   → Construtor · Recrutamento · Pesquisa
+Coleta & Saque     → Farmador · Quebra de Muralhas · Coletor
+Comandos           → Painel · Agendar Comandos · Snipar · Snip Cancel · Auto Desvio
+Painel de Defesa   (tela única)
+Utilidades         → Balanceador · Treinar Paladinos
+Configurações      (tela única)
+```
+
+**Princípio do grupo Comandos**: cada sub-tela é um **facilitador de UI** que monta um comando e injeta no mesmo pipeline do Agendador (`solveOperation` + `Game.submitCommand`). O **Painel** é a única tela que mostra **todos** os comandos vivos, independente de onde nasceram (Agendar / Snipar / Snip Cancel / Auto Desvio / Quebra de Muralhas / Apoio em massa). Comandos com `cancelAt` definido aparecem como 1 linha só, com timeline interna (enviado HH:MM → cancelar HH:MM → volta HH:MM).
+
+Cada item abaixo tem **estado atual** (não existe / parcial / com bug) e **nuance técnica** que precisa ser respeitada na implementação.
+
+### Gerente de Conta
+
+#### Construtor
+- **Bugs no import de modelo do jogo** — hoje quebra ao importar; usuário tem que recriar manualmente. Investigar o parser/decoder do template base64.
+- **Criação manual de modelos** — UI pra montar um template do zero (hoje só importa).
+
+#### Recrutamento
+- **Bugs latentes** — validar se ainda dá pra estourar fila acima do `maxQueues` em race com o jogo (ex.: usuário recruta manualmente entre o `fetchTrainData` e o `submitRecruit`). Investigar antes de adicionar features novas no módulo.
+
+#### Pesquisa
+- Hoje placeholder ("Em breve"). Implementar análogo ao Construtor: profiles com **ordem de pesquisa desejada** (lança → arqueiro → leve → ...), aplicado por grupo de aldeias. Endpoint `screen=smith&mode=research`.
+
+### Coleta & Saque
+
+#### Farmador (já existe)
+- **Spy puro com troca temporária de A** — quando bárbara volta com perdas, hoje só registra em `needsWallBreak`. Ideal trocar A pra `{spy:1, resto:0}` igual o "Buscar bárbaras" e mandar 1 espião pra confirmar muralha/defesa antes de marcar pro Quebra de Muralhas.
+- **Farm de jogadores inativos** — Assistente nativo só lista bárbaras. Pra inativos, vai precisar usar `screen=place` direto. Detecção via `/map/village.txt` (jogadores com `points` baixo + sem mudança recente).
+
+#### Quebra de Muralhas
+- Hoje o Farmador só **detecta** (`hadLosses` → `state.farmer.needsWallBreak`). Falta o disparo: tela própria que lista bárbaras dessa fila e manda aríete + catapulta (alvo `wall`) configuráveis. **Não dá pra usar `am_farm`** — o Assistente não suporta catapulta direcionada a edifício; usar `Game.submitCommand` direto. Comandos gerados aqui aparecem no Painel de Comandos.
+
+#### Coletor
+- **Coleta em massa automática** — endpoint `screen=scavenge` (não tem nada hoje). Configuração por aldeia/grupo: quais 4 níveis usar, quais tropas alocar por nível, intervalo, **limite até o dia atual** (parar quando a próxima coleta cair em D+1). Precisa parser do JSON de status de cada nível e do POST de start.
+
+### Comandos
+
+#### Painel (renomear "Painel" do Agendador atual)
+- Hoje só lista comandos do Agendador. Vira **fonte única de verdade** pra qualquer comando vivo (Agendar / Snipar / Snip Cancel / Auto Desvio / Quebra de Muralhas / Apoio em massa).
+- **Cancelamento como etapa do comando original** — comandos com `cancelAt` aparecem em 1 linha só, com timeline interna: `enviado HH:MM:SS.mmm → cancelar HH:MM:SS.mmm → volta prevista HH:MM`. Pipeline: `send → wait → POST cancel → mark cancelled`. Estado novo no `command`: `cancelAt`, `cancelStatus` (`pending`/`sent`/`failed`), `returnAt` (estimado).
+- **Filtros** por origem (qual tela criou), tipo, status. Coluna "origem" mostra ícone do facilitador.
+
+#### Agendar Comandos (renomear "Agendador")
+- Mesmo wizard que existe hoje. Só renomeia.
+- **Apoios — velocidade real do bloco** — hoje `slowestSpeed()` usa só `BASE_SPEEDS` das unidades enviadas. Pra apoios com paladino, **todas** as tropas viajam na velocidade do paladim (10 mpf base) — geralmente é o paladim que vira a "tropa mais lenta", não a heavy/ram. Além disso:
+  - **Itens de aflição do paladim** (ex.: bota de Hércules / similares) reduzem o tempo de viagem do apoio. Precisa parsear o item equipado em `screen=statue` por aldeia origem.
+  - **Habilidade de tribo "Apoio rápido"** (se ativa no br142) também aplica multiplicador. Verificar via `game_data.player.ally` + endpoint da tribo.
+  - **Implementação**: estender `slowestSpeedMpf` pra receber contexto `{type:'support', sourceVillageId}` e aplicar os bônus em cima. Não tocar em ataque (não tem esses bônus).
+- **Etiquetador automático** — re-etiquetar comandos saintes a cada ~5min com a unidade mais lenta real (o jogo só mostra o ícone genérico). Endpoint: `screen=info_command&id=...&action=label` (validar). Pra apoios, considerar bônus de paladim/itens/habilidade (ver item acima). **Toggle global vive em Configurações.**
+- **Apoio em massa** — facilitador de UI dentro de Agendar. Form "X cavalaria pesada de cada aldeia do grupo Y pra alvo Z", com validação de tropa disponível e disparo no pipeline normal.
+
+#### Snipar (Snipe defensivo)
+- Chegar com **meu apoio** entre os comandos inimigos. Dois modos:
+  - **Aldeia minha sob ataque** — lê `screen=overview_villages&mode=incomings` pra timeline dos comandos chegando.
+  - **Aldeia aliada** — usuário passa coord alvo + horário desejado de chegada; o bot calcula origem/MS.
+- Reusa pipeline de Agendar (`type:'support'`) + a lógica nova de velocidade real do bloco (paladim/itens/tribo). Existem scripts públicos de referência (`lulz`/similares) — servem de baseline, mas a velocidade real do apoio precisa ser nossa.
+- Comando aparece no Painel como linha normal de apoio.
+
+#### Snip Cancel
+- Disparar nobre + cancelar no instante exato pra que as tropas voltem **entre** os nobres do inimigo. UI calcula o `delta` (diferença de MS entre os nobres alvo).
+- **Cancelamento = etapa do comando original**: comando criado já com `cancelAt = executeAt + delta`. Pipeline lida com isso na timeline interna; não cria comando-irmão. Painel mostra a linha única com a timeline.
+
+#### Auto Desvio (reativo)
+- Quando há ataque inimigo chegando (lê de `screen=overview_villages&mode=incomings`), calcula janela segura, manda tropa pra um destino dummy e cancela pra voltar **depois** do ataque inimigo passar (pra não perder tropa).
+- Mesma mecânica de cancelamento do Snip Cancel (`cancelAt` no comando), mas aqui o objetivo é a **volta**, não a chegada. **Escopo só reativo** — sem rotina de "dar uma volta sempre que tiver tropa parada".
+
+### Painel de Defesa (tela única)
+Hoje `state.farmer.threats` + UI `renderDefenses()` é apenas leitura passiva (relatórios capturados pelo farm). Tela nova precisa:
+- **Detecção de ataques recebidos** via `screen=overview_villages&mode=incomings` (paginado, novo método em `Game`). Estado novo: `state.defense.incomings[]`.
+- **Atacantes** — quem está atacando, quantos comandos no total, ETA do primeiro/último, tribo.
+- **Aldeias vulneráveis** — minhas aldeias com defesa baixa pro tamanho do ataque recebido (cruza `fetchAllUnits` com tamanho do ataque inimigo).
+- **Aldeias que precisam de apoio** — sugestão automática integrada com Apoio em massa (botão "enviar apoio" abre o facilitador pré-preenchido).
+- **Filtros, observações por linha, marcação manual** — usuário pode anotar "fake", "real", "ignorar" e isso persiste.
+- **Notificação push** quando novo ataque é detectado (ver Configurações → Notificações).
+- **Sem sub-módulos** — uma tela só, com seções colapsáveis.
+
+### Utilidades
+
+#### Balanceador
+- **Puxar recursos** — opção de "puxar recursos do grupo X pra aldeia Y". Endpoint `screen=market&mode=call_resources` ou envio direto. Útil pra acumular pra construção/recrutamento numa capital.
+- **Balanceamento automático** — distribuir pra que aldeias menores cresçam junto com as maiores. Existem scripts de referência (`farmgod`-style); melhorar levando em conta produção atual + estoque + nível do mercado.
+- **Cunhagem (snob coins)** — cunhar moedas com estoque mínimo. Endpoint `screen=snob&mode=mint`.
+
+#### Treinar Paladinos
+- **Treinamento em massa** — endpoint `screen=statue` por aldeia. Profile global: "treinar paladim em todas as aldeias com estátua e sem paladim".
+
+### Configurações (tela única)
+Tela única com seções colapsáveis. **Sem sub-módulos.** Hoje tem só export/import de configs e re-validar licença. Adicionar:
+- **Licença** — re-validar (já existe), status, expiração, **cache offline com TTL** (hoje bloqueio é total se Vercel cair; considerar cache de last-validated-at de 24h, tradeoff: revogação demora mais a propagar).
+- **Importar / Exportar configurações** (já existe).
+- **Notificações** — toggle por canal:
+  - **Discord**: webhook URL → POST direto do userscript (trivial).
+  - **Telegram**: precisa bot + `chat_id`. Pra esconder o token do bot, relay via `twtime.vercel.app` com novo endpoint `POST /api/notify` (`{nick, channel, message}`).
+  - **Eventos**: novo ataque recebido, captcha disparado, farm bloqueado por captcha, operação concluída, snipe armado/disparado.
+  - **WhatsApp fora do escopo** (custo e fragilidade — Twilio/WABA).
+- **Etiquetador automático** — toggle global do re-label de comandos (a feature em si vive em Agendar Comandos).
+- **Captcha — validar logout automático** — hoje a cascata (`GET /index.php?action=logout` → `location.href` → fallback `/logout.php`) já roda. Pendente: testar em conta real os 3 caminhos, especialmente o fallback `logout.php`. Adicionar telemetria local (qual caminho funcionou) pra tunar o timing. Configuração: tempo de carência ajustável.
+- **Personalização da UI** — tema, posição do launcher, etc. (futuro).
+
+### Servidor (twtime.vercel.app)
+Não aparece na sidebar — é infraestrutura. Roadmap:
+- **Endpoint `/api/notify`** — relay de notificações (ver Configurações → Notificações).
+- **Admin UI** — hoje é HTML simples em `/admin` com login por token em sessionStorage. Funcional pra dezenas de usuários; se virar centenas, paginar `/api/license/list` + busca.
 
 ---
 

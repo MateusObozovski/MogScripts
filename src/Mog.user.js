@@ -4945,13 +4945,25 @@
       const r = await checkLicense();
       if (r.ok) {
         // re-boot fluxo normal sem reload — render normal e religa recoveries
+        unlockSidebar();
         renderContent();
         runBootRecoveries();
+        updateHeadChips();
       } else {
         renderLicenseBlock(r);
       }
     });
     panel.querySelector('#mog-license-export')?.addEventListener('click', exportConfig);
+  }
+
+  // Trava da sidebar enquanto a licença não está validada. O handler de click
+  // dos itens já respeita .mog-side-disabled (linha ~4803), então só toggleamos
+  // a classe — não precisa remover/re-adicionar listeners.
+  function lockSidebar() {
+    panel.querySelectorAll('.mog-side-item[data-section]').forEach(it => it.classList.add('mog-side-disabled'));
+  }
+  function unlockSidebar() {
+    panel.querySelectorAll('.mog-side-item[data-section]').forEach(it => it.classList.remove('mog-side-disabled'));
   }
 
   // Recoveries dos motores (timers que sobrevivem reload). Só roda em fluxo
@@ -5145,6 +5157,8 @@
       btn.textContent = 'Validando…';
       const r = await checkLicense();
       if (!r.ok) {
+        // licença caiu durante uso — trava sidebar pra não burlar
+        lockSidebar();
         renderLicenseBlock(r);
         updateHeadChips();
       } else {
@@ -9291,13 +9305,28 @@
   // Boot async: valida licença ANTES de renderizar painel ou re-agendar timers.
   // Resultado inválido (expirado, nick desconhecido, sem rede) → tela de bloqueio
   // e nenhum motor é religado. Captcha guard segue rodando (vive antes do early-return).
+  //
+  // Importante: a sidebar é amarrada lá em cima e fica clicável desde já. Enquanto
+  // o await não terminar (ou se invalidar), travamos TODOS os itens com
+  // mog-side-disabled — o handler de click já respeita essa classe (linha ~4803).
+  // Conteúdo fica como "Validando licença..." pra usuário não ver UI piscando.
+  lockSidebar();
+  content.innerHTML = `
+    <div style="padding:48px 24px; text-align:center; color:var(--mog-text-mute);">
+      <div style="font-size:32px; margin-bottom:10px;">⏳</div>
+      <div style="font-size:14px;">Validando licença…</div>
+    </div>
+  `;
+
   (async () => {
     const result = await checkLicense();
     if (!result.ok) {
+      // sidebar continua travada — usuário só pode usar "Tentar novamente" ou export
       renderLicenseBlock(result);
       updateHeadChips();
       return;
     }
+    unlockSidebar();
     renderContent();
     runBootRecoveries();
     updateHeadChips();

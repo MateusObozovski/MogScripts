@@ -12,7 +12,38 @@
       "Bash(git fetch *)",
       "Bash(git pull *)",
       "Bash(git stash *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:tribalwarsspeed.yolasite.com)",
+      "WebFetch(domain:forum.tribalwars.net)",
+      "WebFetch(domain:twscripts.dev)",
+      "WebFetch(domain:greasyfork.org)",
+      "WebFetch(domain:shinko-to-kuma.com)",
+      "Bash(gh api *)",
+      "PowerShell(gh api 'search/code?q=%22Timing.getEstimatedLatency%22+tribalwars' 2>&1)",
+      "WebFetch(domain:grep.app)",
+      "WebFetch(domain:gitea.dwysokinski.me)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:forum.tribalwars.co.uk)",
+      "WebFetch(domain:webcache.googleusercontent.com)",
+      "WebFetch(domain:high-minded.net)",
+      "Bash(node -c src/Mog.user.js)",
+      "Bash(node -c dist/Mog.user.js)",
+      "PowerShell($urls = @\\('https://br142.tribalwars.com.br/favicon.ico','https://br142.tribalwars.com.br/robots.txt','https://br142.tribalwars.com.br/graphic/index.png'\\); foreach \\($u in $urls\\) { try { $sw = [Diagnostics.Stopwatch]::StartNew\\(\\); $r = Invoke-WebRequest -Uri $u -Method Head -UseBasicParsing -TimeoutSec 10; $sw.Stop\\(\\); Write-Output \"$u -> $\\($r.StatusCode\\) $\\($r.Headers.'Content-Type'\\) $\\($r.Headers.'Content-Length'\\)B $\\($sw.ElapsedMilliseconds\\)ms cache=$\\($r.Headers.'Cache-Control'\\) server=$\\($r.Headers.Server\\)\" } catch { Write-Output \"$u -> ERRO $\\($_.Exception.Message\\)\" } })",
+      "Bash(curl -sIL \"https://raw.githubusercontent.com/MateusObozovski/MogScripts/refs/heads/claude/tribal-wars-bot-XMdg5/dist/Mog.user.js\")",
+      "Bash(git ls-remote *)",
+      "Bash(curl -sI \"https://raw.githubusercontent.com/MateusObozovski/MogScripts/refs/heads/claude/tribal-wars-bot-XMdg5/dist/Mog.user.js\")",
+      "Bash(git clone *)",
+      "Read(//c/Projetos/TwTime/**)",
+      "Bash(npm install *)",
+      "Bash(node --check c:/Projetos/MogScripts/src/Mog.user.js)",
+      "Bash(node -e \"const fs=require\\('fs'\\);const a=fs.readFileSync\\('c:/Projetos/MogScripts/public/Millennium_sem_fundo.png'\\).toString\\('base64'\\);const b=fs.readFileSync\\('c:/Projetos/MogScripts/public/millenium_full_sem_fundo.png'\\).toString\\('base64'\\);fs.writeFileSync\\('c:/Projetos/MogScripts/.tmp_logo_icon.b64','data:image/png;base64,'+a\\);fs.writeFileSync\\('c:/Projetos/MogScripts/.tmp_logo_wordmark.b64','data:image/png;base64,'+b\\);console.log\\('icon bytes:',a.length,'wordmark bytes:',b.length\\);\")"
+    ],
+    "additionalDirectories": [
+      "c:\\Projetos\\TwTime\\api\\license",
+      "c:\\Projetos\\TwTime\\public",
+      "c:\\Projetos\\TwTime"
     ]
   }
 }

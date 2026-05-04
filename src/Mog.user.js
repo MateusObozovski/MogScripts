@@ -41,28 +41,47 @@
   let captchaChannel = null;
   try { captchaChannel = new BroadcastChannel(CAPTCHA_CHANNEL_NAME); } catch {}
 
-  // Marcadores típicos do hCaptcha/botprotection no TW
+  // Marcadores típicos do hCaptcha/botprotection no TW. Cobertura ampla pra
+  // pegar variações com/sem underscore (`botprotect`, `bot_protect`, `bot_protection`).
   const CAPTCHA_DOM_SELECTORS = [
     '[id*="botprotect"]',
+    '[id*="bot_protect"]',
+    '[id*="bot_protection"]',
     '[id*="bot_check"]',
     '[id*="botcheck"]',
     '[class*="botprotect"]',
+    '[class*="bot_protect"]',
+    '[class*="bot_protection"]',
+    '[class*="popup_box_bot_protection"]',
     '[id*="hcaptcha"]:not([style*="display: none"])',
+    '[class*="hcaptcha"]:not([style*="display: none"])',
+    '[class*="h-captcha"]:not([style*="display: none"])',
     'iframe[src*="hcaptcha.com"]',
+    'iframe[src*="recaptcha"]',
   ];
   // Estritas pra evitar false-positive em comentários inocentes do TW
   const CAPTCHA_HTML_PATTERNS = [
     /bot_protection_active/i,
     /screen=bot_protection/i,
     /popup_box_bot_protection/i,
-    /class\s*=\s*["'][^"']*botprotect/i,
+    /class\s*=\s*["'][^"']*bot[_-]?protect/i,
     /id\s*=\s*["'][^"']*botcheck/i,
+    /id\s*=\s*["'][^"']*bot[_-]?protect/i,
     /\bh-captcha\b/i,
     /hcaptcha\.com\/captcha/i,
   ];
   const CAPTCHA_URL_PATTERNS = [
     /screen=bot_protection/i,
+    /screen=bot_protect/i,
     /botprotection/i,
+    /bot_protection/i,
+    /bot_protect/i,
+  ];
+  // Título da janela como camada extra: TW costuma mudar document.title
+  // quando bot_protection é ativo. Cobre casos onde nem URL nem DOM pega cedo.
+  const CAPTCHA_TITLE_PATTERNS = [
+    /verifica[cç][aã]o de bot/i,
+    /bot.?protect/i,
   ];
 
   function isHcaptchaIframeVisible(el) {
@@ -90,6 +109,15 @@
     const url = unsafeWindow.location?.href || '';
     for (const re of CAPTCHA_URL_PATTERNS) {
       if (re.test(url)) return `URL: ${url}`;
+    }
+    return null;
+  }
+
+  function checkTitleForCaptcha() {
+    const title = (document.title || '').trim();
+    if (!title) return null;
+    for (const re of CAPTCHA_TITLE_PATTERNS) {
+      if (re.test(title)) return `TITLE: ${title}`;
     }
     return null;
   }
@@ -429,7 +457,7 @@
       }
       const obs = new MutationObserver(() => {
         if (captchaHandled) return;
-        const hit = checkDomForCaptcha();
+        const hit = checkDomForCaptcha() || checkTitleForCaptcha();
         if (hit) tripCaptcha(hit);
       });
       obs.observe(document.body, { childList: true, subtree: true });
@@ -444,16 +472,20 @@
     const domHit = checkDomForCaptcha();
     if (domHit) { tripCaptcha(domHit); return; }
 
-    // 4. wrappers
+    // 4. título agora
+    const titleHit = checkTitleForCaptcha();
+    if (titleHit) { tripCaptcha(titleHit); return; }
+
+    // 5. wrappers
     installFetchWrapper();
     installXhrWrapper();
 
-    // 5. URL polling (caso navegação interna do TW)
+    // 6. URL + título polling (caso navegação interna do TW que não muda DOM)
     setInterval(() => {
       if (captchaHandled) return;
-      const u = checkUrlForCaptcha();
-      if (u) tripCaptcha(u);
-    }, 5000);
+      const hit = checkUrlForCaptcha() || checkTitleForCaptcha();
+      if (hit) tripCaptcha(hit);
+    }, 3000);
   }
 
   // boot do guard lite
@@ -710,12 +742,8 @@
   };
 
   const DEFAULT_LATENCY = {
-    avgRtt: 0,         // ms (ida+volta)
-    avgOneWay: 0,      // ms (uplink estimado: rtt - rttBack, derivado do header Date da resposta)
-    avgOffset: 0,      // ms (clock diff: servidor − cliente)
-    manualOverride: 0, // ms (se >0, usa esse valor, ignora medição auto)
-    measuredAt: 0,     // timestamp da última medição
-    samples: 0,        // quantas medições já foram feitas
+    confirmRtts: [],      // últimos 5 RTTs do POST real (rolling window) — só pra log/diagnóstico
+    avgConfirmRtt: 0,     // mediana de confirmRtts — só pra log/diagnóstico
   };
 
   const DEFAULT_STATE = {
@@ -780,14 +808,35 @@
   };
 
   // ---------- storage ----------
+  // Garante que todos os motores começam pausados a cada boot. Recrutador
+  // (global + per-profile), Farmador e Construtor (global + per-profile) ficam
+  // em OFF; usuário precisa religar manualmente. Operações do Agendador NÃO
+  // são mexidas — comandos agendados têm horário específico e desligar
+  // poderia perder ataques cronometrados.
+  function disableAllOnBoot(s) {
+    s.enabled = false;
+    if (s.farmer) s.farmer.enabled = false;
+    if (s.builder) {
+      s.builder.enabled = false;
+      if (Array.isArray(s.builder.profiles)) {
+        for (const p of s.builder.profiles) p.enabled = false;
+      }
+    }
+    if (s.recruiter && Array.isArray(s.recruiter.profiles)) {
+      for (const p of s.recruiter.profiles) p.enabled = false;
+    }
+  }
+
   function loadState() {
     try {
       const raw = GM_getValue(STORAGE_KEY, null);
-      if (!raw) return structuredClone(DEFAULT_STATE);
-      const parsed = JSON.parse(raw);
-      return migrateState(parsed);
+      const fresh = raw ? migrateState(JSON.parse(raw)) : structuredClone(DEFAULT_STATE);
+      disableAllOnBoot(fresh);
+      return fresh;
     } catch {
-      return structuredClone(DEFAULT_STATE);
+      const fresh = structuredClone(DEFAULT_STATE);
+      disableAllOnBoot(fresh);
+      return fresh;
     }
   }
 
@@ -851,11 +900,13 @@
     }
     if (parsed.latency) {
       base.latency = { ...base.latency, ...parsed.latency };
-      // Remove campos de versões antigas que não existem mais no DEFAULT_LATENCY
-      delete base.latency.skewHistory;
-      delete base.latency.skewMedian;
-      delete base.latency.adaptiveComp;
-      delete base.latency.extraBuffer;
+      // Scrub de campos de versões anteriores que não existem mais no DEFAULT_LATENCY
+      for (const k of [
+        'skewHistory', 'skewMedian', 'adaptiveComp', 'extraBuffer',
+        'avgRtt', 'avgOneWay', 'avgOffset', 'confirmOneways', 'avgOneWayUp',
+        'skew', 'skewMeasuredAt', 'biasCalibration', 'measuredAt', 'samples',
+        'manualOverride',
+      ]) delete base.latency[k];
     }
     if (Array.isArray(parsed.log)) base.log = parsed.log;
     if (parsed.ui) base.ui = { ...base.ui, ...parsed.ui };
@@ -993,12 +1044,6 @@
       if (typeof prepareTimers !== 'undefined' && prepareTimers?.clear) {
         prepareTimers.forEach(t => clearTimeout(t));
         prepareTimers.clear();
-      }
-    } catch {}
-    try {
-      if (typeof remeasureTimers !== 'undefined' && remeasureTimers?.clear) {
-        remeasureTimers.forEach(t => clearTimeout(t));
-        remeasureTimers.clear();
       }
     } catch {}
     try {
@@ -1262,6 +1307,7 @@
         headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
         body: body2.toString(),
       });
+      const dateHeader = r2.headers.get('Date');
       const html2 = await r2.text();
 
       const doc2 = new DOMParser().parseFromString(html2, 'text/html');
@@ -1270,7 +1316,7 @@
         const msg = err2.textContent.trim().replace(/\s+/g, ' ').slice(0, 200);
         throw new Error('command rejeitado: ' + (msg || 'erro desconhecido'));
       }
-      return { ok: true };
+      return { ok: true, dateHeader };
     },
 
     // Envio "all-in-one" (legado / usado quando não há tempo pra pré-confirmar).
@@ -2325,126 +2371,32 @@
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // ---------- medição de latência ----------
-  // Mede RTT (ida+volta) e offset (servidor − cliente) usando o header `Date`
-  // das respostas do TW. Resultado em ms.
-  async function measureLatency() {
-    const rttSamples = [];
-    const offsetSamples = [];
-    for (let i = 0; i < 5; i++) {
-      try {
-        const tStart = Date.now();
-        const t0 = performance.now();
-        const r = await fetch('/game.php?screen=overview', { method: 'HEAD', credentials: 'include' });
-        const t1 = performance.now();
-        const tEnd = Date.now();
-        rttSamples.push(t1 - t0);
-        const dateHeader = r.headers.get('Date');
-        if (dateHeader) {
-          const serverTs = new Date(dateHeader).getTime();
-          const localMid = (tStart + tEnd) / 2;
-          offsetSamples.push(serverTs - localMid);
-        }
-      } catch {}
-      await sleep(120);
-    }
-    if (rttSamples.length < 3) return null;
-    const median = arr => {
-      const s = [...arr].sort((a, b) => a - b);
-      return s[Math.floor(s.length / 2)];
-    };
-    const avgRtt = median(rttSamples);
-    const avgOffset = offsetSamples.length >= 3 ? median(offsetSamples) : 0;
-    // oneWay = RTT/2 (assume rede simétrica). A estimativa via header Date é instável
-    // (1s de granularidade + viés de truncamento) e estava produzindo valores zerados.
-    // Manter simples e estável é melhor que tentativa de precisão que falha.
-    const avgOneWay = Math.max(1, Math.round(avgRtt / 2));
-    return { avgRtt: Math.round(avgRtt), avgOffset: Math.round(avgOffset), avgOneWay };
-  }
-
-  async function refreshLatency() {
-    try {
-      const r = await measureLatency();
-      if (!r) return;
-      const lat = state.scheduler.latency;
-      lat.avgRtt = r.avgRtt;
-      lat.avgOffset = r.avgOffset;
-      lat.avgOneWay = r.avgOneWay;
-      lat.measuredAt = Date.now();
-      lat.samples = (lat.samples || 0) + 1;
-      persist();
-    } catch {}
-  }
-
-  // Garante que latência foi medida pelo menos uma vez. Bloqueia se necessário.
-  async function ensureLatencyMeasured() {
-    if (state.scheduler.latency.samples > 0) return;
-    pushSchedulerLog('Medindo latência inicial...');
-    await refreshLatency();
-  }
-
-  // Calibração empírica do viés do Timing do TW: getCurrentServerTime() vem ~250ms
-  // adiantado do server real (provável compensação errada do truncamento do Date header).
-  // Validado com testes reais (sem isso, ataques chegam ~250ms cedo).
-  // Ajuste fixo, não exposto — usuário não precisa mexer.
-  const BIAS_CALIBRATION_MS = 250;
-
-  // Offset (servidor − local) em ms. Prefere Timing nativo do TW (sub-ms, atualizado por
-  // WebSocket) com a calibração empírica subtraída. Fallback pro avgOffset do header Date.
-  function twServerOffset() {
+  // Confia no Timing.getCurrentServerTime() do TW — já calibrado por sessão via
+  // WebSocket. O `diff` entre server time e local clock pode ser grande (segundos),
+  // mas isso é ajuste real cliente↔servidor, não bias a corrigir.
+  function serverToLocalTs(serverTs) {
     const T = unsafeWindow.Timing;
     if (T && typeof T.getCurrentServerTime === 'function') {
-      return T.getCurrentServerTime() - Date.now() - BIAS_CALIBRATION_MS;
+      const offset = T.getCurrentServerTime() - Date.now();
+      return serverTs - offset;
     }
-    return state.scheduler.latency.avgOffset || 0;
+    return serverTs;
   }
 
-  // Converte timestamp do servidor em timestamp local. Usado pra agendar setTimeout/Worker.
-  function serverToLocalTs(serverTs) {
-    return serverTs - twServerOffset();
-  }
-
-  // Hora atual do servidor em ms (sub-ms de precisão via Timing nativo, calibrado).
   function serverNow() {
     const T = unsafeWindow.Timing;
     if (T && typeof T.getCurrentServerTime === 'function') {
-      return T.getCurrentServerTime() - BIAS_CALIBRATION_MS;
+      return T.getCurrentServerTime();
     }
-    return Date.now() + (state.scheduler.latency.avgOffset || 0);
-  }
-
-  // Tempo de antecipação (ms): disparamos `comp` ms antes do executeAt pra o POST chegar
-  // ao servidor exatamente em executeAt. Usa RTT/2 (média de 5 pings, atualizada a cada 5s).
-  function latencyCompensation() {
-    const lat = state.scheduler.latency;
-    if (lat.manualOverride > 0) return lat.manualOverride;
-    return Math.max(1, lat.avgOneWay || Math.round((lat.avgRtt || 0) * 0.5));
-  }
-
-  // ticker de 5s: re-mede latência (não roda se há override manual)
-  setInterval(() => {
-    if (state.scheduler.latency.manualOverride > 0) return;
-    refreshLatency();
-  }, 5 * 1000);
-
-  // pré-aquece TCP/TLS e o handler do servidor antes do envio real.
-  // Quando passamos villageId, fazemos GET no screen=place da origem (mesmo handler do POST → cache quente).
-  // Sem villageId, cai no overview (warmup genérico).
-  function warmupConnection(villageId) {
-    const url = villageId
-      ? `/game.php?village=${villageId}&screen=place`
-      : '/game.php?screen=overview';
-    try { fetch(url, { credentials: 'include' }); } catch {}
+    return Date.now();
   }
 
   // ---------- scheduler de comandos (Agendador) ----------
   const commandTimers = new Map();           // id → fire setTimeout
   const prepareTimers = new Map();           // id → prepare setTimeout
-  const remeasureTimers = new Map();         // id → re-medição de latência setTimeout (T-30s)
   const preparedBundles = new Map();         // bundleLeadId → { hiddenFields, preparedAt }
   const MAX_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;   // 7 dias
   const PREPARE_LEAD_MS = 10 * 1000;         // pré-confirma 10s antes do executeAt
-  const REMEASURE_LEAD_MS = 30 * 1000;       // re-mede latência 30s antes do executeAt
 
   // Acha todos os comandos do mesmo batch (mesma origem→alvo no mesmo "envio").
   // Critério: mesma sourceEntryId + mesmo targetCoords. O 1º (commandIndexInSource=0) é o lead.
@@ -2463,7 +2415,6 @@
   function scheduleCommand(cmd) {
     clearTimeout(commandTimers.get(cmd.id));
     clearTimeout(prepareTimers.get(cmd.id));
-    clearTimeout(remeasureTimers.get(cmd.id));
 
     // Só agendamos o "lead" do batch (commandIndexInSource = 0). Os demais
     // ficam com status 'bundled' — vão junto no mesmo POST.
@@ -2472,11 +2423,11 @@
       return;
     }
 
-    // executeAt está em tempo do servidor. Converte pra tempo local pra usar setTimeout.
-    // Antecipa o disparo pelo RTT/2 (rede).
-    const compensation = latencyCompensation();
+    // executeAt está em server time. O Timing nativo do TW já reporta server time
+    // adiantado em ~uplink ms, então spinar até srvNow >= executeAt já entrega o
+    // POST no servidor no horário certo. Não precisa de compensação adicional.
     const localExecuteAt = serverToLocalTs(cmd.executeAt);
-    const fireDelay = localExecuteAt - Date.now() - compensation;
+    const fireDelay = localExecuteAt - Date.now();
 
     if (fireDelay < -2000) {
       cmd.status = 'failed_overdue';
@@ -2498,14 +2449,6 @@
 
     cmd.status = 'scheduled';
 
-    // PASSO 0 (re-medição de latência): 30s antes do fire, mede latência fresca em background.
-    // Em prepareForFire (T-10s) só LEMOS o resultado, sem await — orçamento de 10s fica livre pro POST de confirm.
-    const remeasureDelay = Math.max(0, fireDelay - REMEASURE_LEAD_MS);
-    const remT = setTimeout(() => {
-      if (state.scheduler.latency.manualOverride === 0) refreshLatency();
-    }, remeasureDelay);
-    remeasureTimers.set(cmd.id, remT);
-
     // PASSO 1 (pré-confirmação): roda 10s antes do fire (ou agora se já está dentro da janela)
     const prepareDelay = Math.max(0, fireDelay - PREPARE_LEAD_MS);
     const prepT = setTimeout(() => prepareForFire(cmd), prepareDelay);
@@ -2521,17 +2464,6 @@
     prepareTimers.delete(cmd.id);
     // se já foi cancelado/abortado, não faz nada
     if (!['scheduled', 'pending'].includes(cmd.status)) return;
-
-    // Re-cálculo do fireDelay com a latência mais recente (já refrescada pelo remeasureTimer em T-30s).
-    // Sem await aqui — o orçamento de 10s vai inteiro pro POST de confirm.
-    if (state.scheduler.latency.manualOverride === 0) {
-      const compensation = latencyCompensation();
-      const localExecuteAt = serverToLocalTs(cmd.executeAt);
-      const newFireDelay = localExecuteAt - Date.now() - compensation;
-      clearTimeout(commandTimers.get(cmd.id));
-      const t = setTimeout(() => executeCommand(cmd), Math.max(0, newFireDelay));
-      commandTimers.set(cmd.id, t);
-    }
 
     cmd.status = 'confirming';
     persist();
@@ -2553,7 +2485,6 @@
       // pré-confirm falhou → cancela o fire e marca tudo como falha
       clearTimeout(commandTimers.get(cmd.id));
       commandTimers.delete(cmd.id);
-      remeasureTimers.delete(cmd.id);
       bundle.forEach(s => {
         s.status = 'failed_request';
         s.lastError = `preparação falhou: ${e.message}`;
@@ -2566,15 +2497,16 @@
 
   async function executeCommand(cmd) {
     commandTimers.delete(cmd.id);
-    remeasureTimers.delete(cmd.id);
     // se ainda está em 'confirming' (passo 1 não terminou), espera curto
     // até passar a 'scheduled' (sucesso) ou outro estado terminal
     let waitedMs = 0;
     while (cmd.status === 'confirming' && waitedMs < 5000) {
       await sleep(50); waitedMs += 50;
     }
-    // se passo 1 falhou ou foi abortado, sai
-    if (cmd.status !== 'scheduled') return;
+    if (cmd.status !== 'scheduled') {
+      pushSchedulerLog(`executeCommand abortado: ${cmd.sourceCoords} → ${cmd.targetCoords} (status=${cmd.status}, esperou ${waitedMs}ms)`);
+      return;
+    }
 
     const prepared = preparedBundles.get(cmd.id);
     if (!prepared) {
@@ -2587,24 +2519,25 @@
     cmd.attempts++;
     persist();
 
-    // pré-aquece conexão TCP ~150ms antes do envio (mantém socket quente, evita slow-start)
-    const compensation = latencyCompensation();
-    const target = serverToLocalTs(cmd.executeAt) - compensation;
-    const warmupAt = target - 150;
-    const driftBeforeWarmup = warmupAt - Date.now();
-    if (driftBeforeWarmup > 0 && driftBeforeWarmup < 5000) {
-      await sleep(driftBeforeWarmup);
-      warmupConnection(cmd.sourceVillageId);   // GET no screen=place da origem (mesmo handler do POST)
-    }
+    // Antecipa o disparo pelo uplink estimado (RTT/2). O wsRtt vem do próprio
+    // WebSocket do TW (Timing.getEstimatedLatency) — calibrado por sessão pelo
+    // servidor, sem constantes hardcoded. Universal pra qualquer rede.
+    const T = unsafeWindow.Timing;
+    const wsRtt = (T && typeof T.getEstimatedLatency === 'function') ? T.getEstimatedLatency() : 0;
+    const compensation = wsRtt > 0 ? Math.round(wsRtt / 2) : 0;
+    const fireAtServer = cmd.executeAt - compensation;
+    const srvNow = serverNow;
 
-    // drift correction final em duas etapas: sleep grosso + busy-wait fino dos últimos 15ms.
-    // setTimeout/sleep tem precisão ~4ms+ e atrasa sob carga; busy-wait com performance.now() é exato.
-    const drift = target - Date.now();
-    if (drift > 15 && drift < 1000) await sleep(drift - 15);
-    const tHigh = performance.now() + Math.max(0, target - Date.now());
-    while (performance.now() < tHigh) { /* spin curto até o instante exato */ }
-    const finalDrift = target - Date.now(); // medido ANTES do POST (quanto atrasamos no busy-wait)
+    // sleep até 200ms antes do alvo, depois busy-wait. setTimeout pode overshoot
+    // ~50-150ms, mas a janela de 200ms de spin absorve sem afetar a precisão final.
+    const longSleep = fireAtServer - srvNow() - 200;
+    if (longSleep > 0 && longSleep < 5000) await sleep(longSleep);
+    // safety: limita spin a 1s pra evitar travar o browser caso Timing trave por algum motivo
+    const spinDeadline = Date.now() + 1000;
+    while (srvNow() < fireAtServer && Date.now() < spinDeadline) { /* spin */ }
+    const finalDrift = fireAtServer - srvNow(); // medido ANTES do POST (deve ser ~0 ou levemente negativo)
 
+    const t0_post = Date.now();
     try {
       const res = await Game.confirmCommand({
         fromVillageId: cmd.sourceVillageId,
@@ -2613,12 +2546,19 @@
         type: cmd.type,
         catapultTarget: cmd.catapultTarget,
       });
+      const rtt_confirm = Date.now() - t0_post;
       bundle.forEach(s => { s.status = 'sent'; s.serverResponse = res; });
-      const skew = serverNow() - cmd.executeAt;
+
+      // Aprende: atualiza histórico de RTT do POST real (rolling window 5).
       const lat = state.scheduler.latency;
+      lat.confirmRtts = [...(lat.confirmRtts || []), rtt_confirm].slice(-5);
+      const sortedRtts = [...lat.confirmRtts].sort((a, b) => a - b);
+      lat.avgConfirmRtt = sortedRtts[Math.floor(sortedRtts.length / 2)];
+
+      const skew = serverNow() - cmd.executeAt;
       const skewSign = skew >= 0 ? '+' : '';
       const totalAttacks = bundle.length;
-      pushSchedulerLog(`enviado: ${cmd.sourceCoords} → ${cmd.targetCoords} (${cmd.type}, ${totalAttacks} ataque${totalAttacks > 1 ? 's' : ''}) · skew=${skewSign}${skew} rtt=${lat.avgRtt} oneWay=${lat.avgOneWay} comp=${compensation} drift=${finalDrift}`);
+      pushSchedulerLog(`enviado: ${cmd.sourceCoords} → ${cmd.targetCoords} (${cmd.type}, ${totalAttacks} ataque${totalAttacks > 1 ? 's' : ''}) · skew=${skewSign}${Math.round(skew)} confirmRtt=${rtt_confirm} wsRtt=${wsRtt} comp=${compensation} drift=${Math.round(finalDrift)}`);
     } catch (e) {
       bundle.forEach(s => { s.status = 'failed_request'; s.lastError = e.message; });
       pushSchedulerLog(`FALHA: ${cmd.sourceCoords} → ${cmd.targetCoords}: ${e.message}`);
@@ -3430,6 +3370,120 @@
     .mog-wiz-fld input[type="number"]:focus { border-color: ${COLOR_ACCENT}; }
     .mog-wiz-fld input.mog-input-error,
     .mog-wiz-fld input.mog-input-error:focus { border-color: var(--mog-error); }
+    /* Input com máscara fixa (DD/MM/YYYY HH:MM:SS): mono + tabular pra alinhar dígitos */
+    .mog-mask-input {
+      font-family: 'JetBrains Mono', 'Consolas', monospace !important;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.5px;
+      padding-right: 36px !important;   /* espaço pro botão de calendário */
+    }
+    /* Wrapper do input mascarado + botão de calendário */
+    .mog-dt-wrap { position: relative; }
+    .mog-dt-cal-btn {
+      position: absolute;
+      right: 4px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 4px;
+      cursor: pointer;
+      padding: 4px;
+      display: flex; align-items: center; justify-content: center;
+      color: var(--mog-text-mute);
+      transition: color 0.15s, background 0.15s, border-color 0.15s;
+    }
+    .mog-dt-cal-btn:hover {
+      color: ${COLOR_ACCENT};
+      background: var(--mog-surface-hover);
+      border-color: var(--mog-border-soft);
+    }
+    .mog-dt-cal-btn:active { transform: translateY(-50%) scale(0.95); }
+
+    /* Popup customizado (pt-BR + 24h) — substitui native picker do browser */
+    .mog-dt-popup {
+      position: absolute;
+      top: calc(100% + 4px);
+      right: 0;
+      z-index: 1000;
+      width: 280px;
+      background: var(--mog-surface-2);
+      border: 1px solid var(--mog-border);
+      border-radius: 8px;
+      padding: 10px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    }
+    .mog-dt-popup[hidden] { display: none; }
+    .mog-dt-pop-head {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 8px;
+    }
+    .mog-dt-pop-title {
+      font-weight: 700; color: var(--mog-text); font-size: 12px;
+      text-transform: uppercase; letter-spacing: 0.5px;
+    }
+    .mog-dt-pop-nav {
+      background: transparent; border: 1px solid var(--mog-border-soft);
+      border-radius: 4px; color: var(--mog-text); cursor: pointer;
+      width: 26px; height: 26px; font-size: 16px; line-height: 1;
+      padding: 0; display: flex; align-items: center; justify-content: center;
+    }
+    .mog-dt-pop-nav:hover { background: var(--mog-surface-hover); border-color: ${COLOR_ACCENT}; color: ${COLOR_ACCENT}; }
+    .mog-dt-pop-grid {
+      display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px;
+      margin-bottom: 10px;
+    }
+    .mog-dt-pop-dh {
+      font-size: 10px; font-weight: 600; color: var(--mog-text-mute);
+      text-align: center; padding: 4px 0; text-transform: uppercase;
+    }
+    .mog-dt-pop-day {
+      background: transparent; border: 1px solid transparent;
+      color: var(--mog-text); font-size: 11.5px; font-weight: 500;
+      padding: 6px 0; cursor: pointer; border-radius: 4px;
+      font-family: inherit;
+    }
+    .mog-dt-pop-day:hover { background: var(--mog-surface-hover); border-color: var(--mog-border-soft); }
+    .mog-dt-pop-day-off { color: var(--mog-text-mute); opacity: 0.5; }
+    .mog-dt-pop-day-today { border-color: var(--mog-border); font-weight: 700; }
+    .mog-dt-pop-day-sel {
+      background: ${COLOR_ACCENT}; color: #fff; font-weight: 700;
+      border-color: ${COLOR_ACCENT};
+    }
+    .mog-dt-pop-day-sel:hover { background: ${COLOR_ACCENT}; }
+    .mog-dt-pop-time {
+      display: flex; align-items: center; justify-content: center; gap: 6px;
+      padding: 8px 0; border-top: 1px solid var(--mog-border-soft);
+    }
+    .mog-dt-pop-time input {
+      background: var(--mog-bg-deep); border: 1px solid var(--mog-border);
+      border-radius: 4px; color: var(--mog-text);
+      font-family: 'JetBrains Mono', 'Consolas', monospace;
+      font-size: 14px; font-weight: 600; padding: 4px 6px;
+      width: 44px; text-align: center; outline: none;
+      -moz-appearance: textfield;
+    }
+    .mog-dt-pop-time input:focus { border-color: ${COLOR_ACCENT}; }
+    .mog-dt-pop-time input::-webkit-inner-spin-button,
+    .mog-dt-pop-time input::-webkit-outer-spin-button {
+      -webkit-appearance: none; margin: 0;
+    }
+    .mog-dt-pop-time span { color: var(--mog-text-mute); font-weight: 700; }
+    .mog-dt-pop-foot {
+      display: flex; gap: 6px; padding-top: 8px;
+      border-top: 1px solid var(--mog-border-soft);
+    }
+    .mog-dt-pop-btn {
+      flex: 1; background: var(--mog-bg-deep); border: 1px solid var(--mog-border-soft);
+      border-radius: 4px; color: var(--mog-text); cursor: pointer;
+      padding: 6px 0; font-size: 11px; font-weight: 600;
+      font-family: inherit; text-transform: uppercase; letter-spacing: 0.4px;
+    }
+    .mog-dt-pop-btn:hover { background: var(--mog-surface-hover); border-color: ${COLOR_ACCENT}; }
+    .mog-dt-pop-btn-ok {
+      background: ${COLOR_ACCENT}; color: #fff; border-color: ${COLOR_ACCENT};
+    }
+    .mog-dt-pop-btn-ok:hover { filter: brightness(1.1); background: ${COLOR_ACCENT}; }
     .mog-wiz-fld input[type="number"] {
       -moz-appearance: textfield; text-align: center; font-weight: 600;
     }
@@ -4536,8 +4590,15 @@
     const tripped = state.captchaTrippedAt > 0;
     chipCaptcha.hidden = !tripped;
 
-    // RTT — cor por threshold
-    const rtt = state.scheduler?.latency?.avgRtt;
+    // RTT — usa o medido nos POSTs reais; fallback pro WS nativo do TW
+    let rtt = state.scheduler?.latency?.avgConfirmRtt || 0;
+    if (rtt <= 0) {
+      const T = unsafeWindow.Timing;
+      if (T && typeof T.getEstimatedLatency === 'function') {
+        const ws = T.getEstimatedLatency();
+        if (ws > 0) rtt = ws;
+      }
+    }
     if (Number.isFinite(rtt) && rtt > 0) {
       chipRtt.textContent = `RTT ${Math.round(rtt)}ms`;
       chipRtt.classList.remove('mog-chip-warn', 'mog-chip-error', 'mog-chip-ok');
@@ -4781,6 +4842,15 @@
   // ---- passo 1: alvos ----
   function renderWizardStep1(op) {
     if (!op.defaultArrival) op.defaultArrival = { datetime: 0, ms: 0 };
+    // Default = data/hora atual do servidor (sempre que ainda não foi definido).
+    // Usuário pode ajustar livremente depois; o valor escolhido persiste.
+    if (!op.defaultArrival.datetime) {
+      const now = new Date(serverNow());
+      // zera os ms (campo separado) — pega só até segundos
+      now.setMilliseconds(0);
+      op.defaultArrival.datetime = now.getTime();
+      persist();
+    }
     const body = content.querySelector('#mog-wiz-body');
     const arrivalStr = fmtDateForInput(op.defaultArrival.datetime);
     body.innerHTML = `
@@ -4791,11 +4861,22 @@
         <div class="mog-wiz-default-arrival">
           <div class="mog-wiz-fld" style="flex:2;">
             <label>Data e hora</label>
-            <input type="text" id="mog-wiz-default-dt"
-              placeholder="DD/MM/YYYY HH:MM:SS"
-              autocomplete="off"
-              spellcheck="false"
-              value="${escapeHtml(arrivalStr)}">
+            <div class="mog-dt-wrap">
+              <input type="text" id="mog-wiz-default-dt" class="mog-mask-input"
+                autocomplete="off"
+                spellcheck="false"
+                inputmode="numeric"
+                value="${escapeHtml(arrivalStr)}">
+              <button type="button" id="mog-wiz-default-dt-btn" class="mog-dt-cal-btn" title="Abrir calendário" tabindex="-1">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="4" width="18" height="18" rx="2"/>
+                  <line x1="16" y1="2" x2="16" y2="6"/>
+                  <line x1="8" y1="2" x2="8" y2="6"/>
+                  <line x1="3" y1="10" x2="21" y2="10"/>
+                </svg>
+              </button>
+              <div id="mog-wiz-default-dt-popup" class="mog-dt-popup" hidden></div>
+            </div>
           </div>
           <div class="mog-wiz-fld" style="flex:1;">
             <label>MS padrão</label>
@@ -4851,25 +4932,239 @@
     `;
 
     const dtInp = body.querySelector('#mog-wiz-default-dt');
-    dtInp.addEventListener('change', e => {
-      const raw = e.target.value.trim();
-      if (!raw) {
-        op.defaultArrival.datetime = 0;
-        e.target.classList.remove('mog-input-error');
-      } else {
-        const parsed = parseDateFromInput(raw);
+    // Garante que sempre exibe a máscara completa "__/__/____ __:__:__".
+    if (!dtInp.value) dtInp.value = DT_MASK_TEMPLATE;
+
+    // Posiciona cursor no próximo slot vazio (ou após o último dígito se completo).
+    const moveCursorToNextEmptySlot = () => {
+      const digits = readDtMaskDigits(dtInp.value);
+      const idx = digits.length;
+      const pos = idx < DT_DIGIT_SLOTS.length ? DT_DIGIT_SLOTS[idx] : DT_DIGIT_SLOTS[DT_DIGIT_SLOTS.length - 1] + 1;
+      dtInp.setSelectionRange(pos, pos);
+    };
+
+    // Aplica novos dígitos à máscara, atualiza state e reposiciona cursor.
+    const applyDigits = digits => {
+      const clean = digits.replace(/\D/g, '').slice(0, 14);
+      dtInp.value = buildDtMask(clean);
+      const idx = clean.length;
+      const pos = idx < DT_DIGIT_SLOTS.length ? DT_DIGIT_SLOTS[idx] : DT_DIGIT_SLOTS[DT_DIGIT_SLOTS.length - 1] + 1;
+      dtInp.setSelectionRange(pos, pos);
+      // commita state se completo, senão zera
+      if (clean.length === 14) {
+        const parsed = parseDateFromInput(dtInp.value);
         if (parsed) {
           op.defaultArrival.datetime = parsed;
-          e.target.value = fmtDateForInput(parsed);   // re-formata canônico
-          e.target.classList.remove('mog-input-error');
+          dtInp.classList.remove('mog-input-error');
         } else {
-          e.target.classList.add('mog-input-error');
-          pushSchedulerLog('Formato inválido. Use DD/MM/YYYY HH:MM:SS (ex: 02/05/2026 19:19:00).');
-          return;
+          dtInp.classList.add('mog-input-error');
         }
+      } else {
+        op.defaultArrival.datetime = 0;
+        dtInp.classList.remove('mog-input-error');
       }
       persist();
+    };
+
+    dtInp.addEventListener('beforeinput', e => {
+      const t = e.inputType;
+      const current = readDtMaskDigits(dtInp.value);
+      if (t === 'insertText') {
+        e.preventDefault();
+        if (!/^\d+$/.test(e.data || '')) return;
+        applyDigits(current + e.data);
+      } else if (t === 'insertFromPaste') {
+        e.preventDefault();
+        const pasted = (e.data || '').replace(/\D/g, '');
+        if (pasted) applyDigits(current + pasted);
+      } else if (t === 'deleteContentBackward' || t === 'deleteContentForward') {
+        e.preventDefault();
+        applyDigits(current.slice(0, -1));
+      } else if (t === 'deleteWordBackward' || t === 'deleteWordForward') {
+        e.preventDefault();
+        applyDigits('');
+      } else if (t && t.startsWith('insert')) {
+        // bloqueia outros tipos de inserção (drag-drop, autocomplete, etc.)
+        e.preventDefault();
+      }
     });
+
+    dtInp.addEventListener('focus', () => {
+      if (!dtInp.value || dtInp.value.length < DT_MASK_TEMPLATE.length) {
+        dtInp.value = buildDtMask(readDtMaskDigits(dtInp.value || ''));
+      }
+      setTimeout(moveCursorToNextEmptySlot, 0);
+    });
+    dtInp.addEventListener('click', () => moveCursorToNextEmptySlot());
+
+    // Bloqueia interações que podem corromper a máscara.
+    dtInp.addEventListener('keydown', e => {
+      // permite navegação e atalhos de seleção/cópia
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const allowed = ['Tab', 'Enter', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'Backspace', 'Delete'];
+      if (allowed.includes(e.key)) return;
+      // tudo que não é dígito é bloqueado
+      if (e.key.length === 1 && !/^\d$/.test(e.key)) e.preventDefault();
+    });
+
+    // Seletor customizado em pt-BR (24h, sem AM/PM). Native picker do Chrome ignora
+    // lang= e usa idioma do browser — por isso construímos próprio.
+    const calBtn = body.querySelector('#mog-wiz-default-dt-btn');
+    const popup = body.querySelector('#mog-wiz-default-dt-popup');
+    const MES_NOMES = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
+    const DIA_NOMES = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
+    // estado do popup: mês visível + data selecionada (Date object ou null)
+    const pickerState = {
+      view: null,        // Date apontando pro 1º dia do mês exibido
+      sel: null,         // Date completa selecionada (com hora)
+    };
+
+    const renderPicker = () => {
+      const view = pickerState.view;
+      const sel = pickerState.sel;
+      const today = new Date();
+      const sameDay = (a, b) => a && b && a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+
+      // primeiro dia do mês + dia da semana inicial
+      const first = new Date(view.getFullYear(), view.getMonth(), 1);
+      const startDow = first.getDay();   // 0=Dom
+      const daysInMonth = new Date(view.getFullYear(), view.getMonth() + 1, 0).getDate();
+      const cells = [];
+      // dias do mês anterior pra preencher antes do dia 1
+      const prevMonthDays = new Date(view.getFullYear(), view.getMonth(), 0).getDate();
+      for (let i = startDow - 1; i >= 0; i--) {
+        cells.push({ d: prevMonthDays - i, off: true, date: new Date(view.getFullYear(), view.getMonth() - 1, prevMonthDays - i) });
+      }
+      for (let i = 1; i <= daysInMonth; i++) {
+        cells.push({ d: i, off: false, date: new Date(view.getFullYear(), view.getMonth(), i) });
+      }
+      // completa pra 6 semanas (42 células)
+      let nextDay = 1;
+      while (cells.length < 42) {
+        cells.push({ d: nextDay, off: true, date: new Date(view.getFullYear(), view.getMonth() + 1, nextDay) });
+        nextDay++;
+      }
+
+      const hh = sel ? String(sel.getHours()).padStart(2, '0') : '00';
+      const mm = sel ? String(sel.getMinutes()).padStart(2, '0') : '00';
+      const ss = sel ? String(sel.getSeconds()).padStart(2, '0') : '00';
+
+      popup.innerHTML = `
+        <div class="mog-dt-pop-head">
+          <button type="button" class="mog-dt-pop-nav" data-cal-act="prev" title="Mês anterior">‹</button>
+          <span class="mog-dt-pop-title">${MES_NOMES[view.getMonth()]} ${view.getFullYear()}</span>
+          <button type="button" class="mog-dt-pop-nav" data-cal-act="next" title="Próximo mês">›</button>
+        </div>
+        <div class="mog-dt-pop-grid">
+          ${DIA_NOMES.map(n => `<div class="mog-dt-pop-dh">${n}</div>`).join('')}
+          ${cells.map(c => {
+            const isToday = sameDay(c.date, today);
+            const isSel = sameDay(c.date, sel);
+            const cls = ['mog-dt-pop-day'];
+            if (c.off) cls.push('mog-dt-pop-day-off');
+            if (isToday) cls.push('mog-dt-pop-day-today');
+            if (isSel) cls.push('mog-dt-pop-day-sel');
+            return `<button type="button" class="${cls.join(' ')}" data-cal-act="day" data-y="${c.date.getFullYear()}" data-m="${c.date.getMonth()}" data-d="${c.date.getDate()}">${c.d}</button>`;
+          }).join('')}
+        </div>
+        <div class="mog-dt-pop-time">
+          <input type="number" min="0" max="23" data-cal-act="hh" value="${hh}" title="Horas (0-23)">
+          <span>:</span>
+          <input type="number" min="0" max="59" data-cal-act="mm" value="${mm}" title="Minutos">
+          <span>:</span>
+          <input type="number" min="0" max="59" data-cal-act="ss" value="${ss}" title="Segundos">
+        </div>
+        <div class="mog-dt-pop-foot">
+          <button type="button" class="mog-dt-pop-btn" data-cal-act="today">Hoje</button>
+          <button type="button" class="mog-dt-pop-btn" data-cal-act="clear">Limpar</button>
+          <button type="button" class="mog-dt-pop-btn mog-dt-pop-btn-ok" data-cal-act="ok">OK</button>
+        </div>
+      `;
+
+      // bind handlers
+      popup.querySelectorAll('[data-cal-act]').forEach(el => {
+        const act = el.dataset.calAct;
+        if (act === 'prev' || act === 'next') {
+          el.addEventListener('click', () => {
+            pickerState.view = new Date(view.getFullYear(), view.getMonth() + (act === 'next' ? 1 : -1), 1);
+            renderPicker();
+          });
+        } else if (act === 'day') {
+          el.addEventListener('click', () => {
+            const y = parseInt(el.dataset.y, 10);
+            const m = parseInt(el.dataset.m, 10);
+            const d = parseInt(el.dataset.d, 10);
+            const cur = pickerState.sel;
+            const h = cur ? cur.getHours() : 0;
+            const min = cur ? cur.getMinutes() : 0;
+            const sec = cur ? cur.getSeconds() : 0;
+            pickerState.sel = new Date(y, m, d, h, min, sec, 0);
+            pickerState.view = new Date(y, m, 1);
+            renderPicker();
+          });
+        } else if (act === 'hh' || act === 'mm' || act === 'ss') {
+          el.addEventListener('change', () => {
+            const cur = pickerState.sel || new Date(view.getFullYear(), view.getMonth(), 1, 0, 0, 0);
+            const v = parseInt(el.value, 10);
+            if (isNaN(v)) return;
+            if (act === 'hh') cur.setHours(Math.max(0, Math.min(23, v)));
+            else if (act === 'mm') cur.setMinutes(Math.max(0, Math.min(59, v)));
+            else cur.setSeconds(Math.max(0, Math.min(59, v)));
+            pickerState.sel = cur;
+            renderPicker();
+          });
+        } else if (act === 'today') {
+          el.addEventListener('click', () => {
+            const now = new Date();
+            pickerState.sel = now;
+            pickerState.view = new Date(now.getFullYear(), now.getMonth(), 1);
+            renderPicker();
+          });
+        } else if (act === 'clear') {
+          el.addEventListener('click', () => {
+            pickerState.sel = null;
+            renderPicker();
+          });
+        } else if (act === 'ok') {
+          el.addEventListener('click', () => {
+            if (pickerState.sel) {
+              const ms = pickerState.sel.getTime();
+              op.defaultArrival.datetime = ms;
+              dtInp.value = fmtDateForInput(ms);
+              dtInp.classList.remove('mog-input-error');
+            } else {
+              op.defaultArrival.datetime = 0;
+              dtInp.value = DT_MASK_TEMPLATE;
+            }
+            persist();
+            popup.hidden = true;
+          });
+        }
+      });
+    };
+
+    const closePicker = () => { popup.hidden = true; };
+    const openPicker = () => {
+      const cur = op.defaultArrival.datetime ? new Date(op.defaultArrival.datetime) : new Date();
+      pickerState.sel = op.defaultArrival.datetime ? new Date(op.defaultArrival.datetime) : null;
+      pickerState.view = new Date(cur.getFullYear(), cur.getMonth(), 1);
+      popup.hidden = false;
+      renderPicker();
+    };
+
+    calBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      if (popup.hidden) openPicker(); else closePicker();
+    });
+
+    // fecha clicando fora
+    document.addEventListener('click', e => {
+      if (popup.hidden) return;
+      if (!popup.contains(e.target) && e.target !== calBtn && !calBtn.contains(e.target)) {
+        closePicker();
+      }
+    });
+
     body.querySelector('#mog-wiz-default-ms').addEventListener('change', e => {
       const v = Math.max(0, Math.min(999, parseInt(e.target.value, 10) || 0));
       op.defaultArrival.ms = v;
@@ -4974,22 +5269,55 @@
     persist();
   }
 
-  // "DD/MM/YYYY HH:MM:SS" — formato pra input texto (sem ms).
-  function fmtDateForInput(ms) {
-    if (!ms) return '';
-    const d = new Date(ms);
-    const pad = n => String(n).padStart(2, '0');
-    return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  // ----- Máscara de input de data/hora -----
+  // Template fixo: "DD/MM/AAAA HH:MM:SS" (19 chars). Posições dos dígitos abaixo;
+  // separadores ficam visíveis e não são editáveis.
+  const DT_MASK_TEMPLATE = '__/__/____ __:__:__';
+  const DT_DIGIT_SLOTS = [0, 1, 3, 4, 6, 7, 8, 9, 11, 12, 14, 15, 17, 18];
+
+  // Constrói o texto da máscara dada uma string de até 14 dígitos.
+  function buildDtMask(digits) {
+    const arr = DT_MASK_TEMPLATE.split('');
+    const d = String(digits).replace(/\D/g, '').slice(0, 14);
+    for (let i = 0; i < d.length; i++) arr[DT_DIGIT_SLOTS[i]] = d[i];
+    return arr.join('');
   }
 
-  // Parseia "DD/MM/YYYY HH:MM[:SS]" → Unix ms. Retorna 0 se inválido.
+  // Lê só os dígitos preenchidos na máscara (para na primeira posição vazia).
+  function readDtMaskDigits(value) {
+    let out = '';
+    for (const pos of DT_DIGIT_SLOTS) {
+      if (pos >= value.length) break;
+      const c = value[pos];
+      if (c >= '0' && c <= '9') out += c;
+      else break;
+    }
+    return out;
+  }
+
+  // "DD/MM/AAAA HH:MM:SS" — texto pra carregar no input com máscara.
+  function fmtDateForInput(ms) {
+    if (!ms) return DT_MASK_TEMPLATE;
+    const d = new Date(ms);
+    const pad = n => String(n).padStart(2, '0');
+    const digits = pad(d.getDate()) + pad(d.getMonth() + 1) + d.getFullYear()
+                 + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
+    return buildDtMask(digits);
+  }
+
+  // Parseia o texto da máscara → Unix ms. Precisa dos 14 dígitos completos.
   function parseDateFromInput(str) {
     if (!str) return 0;
-    const m = String(str).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$/);
-    if (!m) return 0;
-    const [, dd, mm, yyyy, hh, MM, ss] = m;
-    const d = new Date(parseInt(yyyy, 10), parseInt(mm, 10) - 1, parseInt(dd, 10),
-                       parseInt(hh, 10), parseInt(MM, 10), parseInt(ss || '0', 10), 0);
+    const digits = String(str).replace(/\D/g, '');
+    if (digits.length !== 14) return 0;
+    const dd = parseInt(digits.slice(0, 2), 10);
+    const mm = parseInt(digits.slice(2, 4), 10);
+    const yyyy = parseInt(digits.slice(4, 8), 10);
+    const hh = parseInt(digits.slice(8, 10), 10);
+    const MM = parseInt(digits.slice(10, 12), 10);
+    const ss = parseInt(digits.slice(12, 14), 10);
+    if (mm < 1 || mm > 12 || dd < 1 || dd > 31 || hh > 23 || MM > 59 || ss > 59) return 0;
+    const d = new Date(yyyy, mm - 1, dd, hh, MM, ss, 0);
     if (isNaN(d.getTime())) return 0;
     return d.getTime();
   }
@@ -5475,7 +5803,6 @@
   async function solveOperation(op) {
     pushSchedulerLog(`[${op.name}] iniciando cálculo...`);
     await ensureWorldConfig();
-    await ensureLatencyMeasured();
     const now = serverNow();
 
     // 1. expande slots por alvo (em ordem de cadastro)
@@ -5944,10 +6271,8 @@
       if (['pending', 'scheduled', 'confirming', 'bundled'].includes(s.status)) {
         clearTimeout(commandTimers.get(s.id));
         clearTimeout(prepareTimers.get(s.id));
-        clearTimeout(remeasureTimers.get(s.id));
         commandTimers.delete(s.id);
         prepareTimers.delete(s.id);
-        remeasureTimers.delete(s.id);
         preparedBundles.delete(s.id);
         s.status = 'aborted';
       }
@@ -5972,8 +6297,6 @@
   let dashboardShowHistory = false;
 
   function renderDashboard() {
-    const lat = state.scheduler.latency;
-    const autoPing = lat.manualOverride === 0;
     const allCmds = getAllScheduledCommands();
     const TERMINAL = ['sent', 'failed_request', 'failed_overdue', 'aborted'];
     const active = allCmds.filter(c => !TERMINAL.includes(c.status));
@@ -5990,21 +6313,6 @@
       </div>
 
       <div class="mog-dash-toolbar">
-        <div class="mog-dash-toolbar-section">
-          <div class="mog-dash-toggle ${autoPing ? 'mog-dash-toggle-on' : ''}" id="mog-dash-ping-toggle" title="Ativar/desativar cálculo automático de ping"></div>
-          <span>Ping automático ${autoPing ? '<strong>ligado</strong>' : '<strong>desligado</strong>'}</span>
-        </div>
-        ${autoPing ? `
-          <div class="mog-dash-toolbar-section">
-            <span>Ping calculado: <strong style="color:${COLOR_ACCENT};">${latencyCompensation()} ms</strong></span>
-          </div>
-        ` : `
-          <div class="mog-dash-toolbar-section">
-            <span>Antecipação manual:</span>
-            <input type="number" min="0" max="2000" id="mog-dash-manual-input" value="${lat.manualOverride}">
-            <span>ms</span>
-          </div>
-        `}
         <div class="mog-dash-toolbar-spacer"></div>
         <button class="mog-log-action" id="mog-dash-clear-history" ${history.length === 0 ? 'disabled style="opacity:0.4;cursor:not-allowed;"' : ''}>Limpar histórico</button>
       </div>
@@ -6018,28 +6326,6 @@
         ${dashboardShowHistory ? '<div id="mog-dash-history"></div>' : ''}
       ` : ''}
     `;
-
-    // toggle ping automático
-    content.querySelector('#mog-dash-ping-toggle').addEventListener('click', () => {
-      if (lat.manualOverride > 0) {
-        lat.manualOverride = 0;
-      } else {
-        lat.manualOverride = Math.max(1, Math.round(lat.avgRtt * 0.5));
-      }
-      persist();
-      renderDashboard();
-    });
-
-    const inp = content.querySelector('#mog-dash-manual-input');
-    if (inp) {
-      inp.addEventListener('change', e => {
-        const v = Math.max(1, Math.min(2000, parseInt(e.target.value, 10) || 1));
-        lat.manualOverride = v;
-        e.target.value = v;
-        persist();
-        renderDashboard();
-      });
-    }
 
     const histBtn = content.querySelector('#mog-dash-history-btn');
     if (histBtn) {
@@ -8357,11 +8643,7 @@
       if (p.enabled) scheduleProfileNext(p);
     });
   }
-  // medição inicial de latência ANTES de recover (pra que executeAt seja convertido corretamente)
-  (async () => {
-    if (state.scheduler.latency.manualOverride === 0) await refreshLatency();
-    recoverScheduledCommands();
-  })();
+  recoverScheduledCommands();
 
   // farmer: re-agenda timer se enabled antes do reload
   recoverFarmerSchedule();

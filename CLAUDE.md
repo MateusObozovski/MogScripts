@@ -169,8 +169,9 @@ Termos usados no código e nas conversas com o usuário:
   - **BroadcastChannel** `mog-captcha-v1` — mensagens `{type:'TRIP'|'REACTIVATE', reason?, ts, sourceTab}`. Latência <50ms. Anti-eco via `sourceTab === TAB_ID` skip.
   - **GM key global** `mog_captcha_global_v1` — fonte de verdade persistida `{trippedAt, reason, sourceTab}`. Sobrevive reload. Polling fallback de 3s caso BroadcastChannel falhe. **Reativar APAGA a chave** (não zera) via `GM_deleteValue`.
 - **Detecção** (`tripCaptcha` é idempotente, dedupe via `captchaHandled`):
-  - **DOM**: `MutationObserver` em `body` + selectors estritos (`[id*="botprotect"]`, iframe `hcaptcha.com` visível, etc.).
-  - **URL**: poll a cada 5s + check inicial (`screen=bot_protection`, `botprotection`).
+  - **DOM**: `MutationObserver` em `body` + selectors com cobertura ampla — variações com/sem underscore (`botprotect`, `bot_protect`, `bot_protection`, `popup_box_bot_protection`), `hcaptcha`/`h-captcha`, iframes `hcaptcha.com`/`recaptcha`.
+  - **URL**: poll a cada 3s + check inicial — cobre `screen=bot_protection`, `screen=bot_protect`, `bot_protection`, `bot_protect`, `botprotection`.
+  - **Título**: poll a cada 3s + check inicial — cobre `verificação de bot`, `bot.?protect` (caso TW mude `document.title` antes do DOM atualizar).
   - **Fetch**: wrapper em `unsafeWindow.fetch` — só inspeciona content-type HTML/JSON/text de mesma origem, primeiros 5000 chars.
   - **XHR**: wrapper em `XMLHttpRequest.prototype.open/send` — escuta `readystatechange === 4`, mesmas regras.
   - **Regex** estritas (não `bot[\s_-]*protection` genérico): `bot_protection_active`, `screen=bot_protection`, `popup_box_bot_protection`, `class="..botprotect..`, `\bh-captcha\b`, `hcaptcha\.com\/captcha`.

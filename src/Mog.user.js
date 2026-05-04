@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Millennium
-// @version      0.8.0
+// @version      0.8.1
 // @description  Toolkit pessoal para Tribal Wars
 // @match        https://*.tribalwars.com.br/game.php?*
 // @grant        GM_addStyle
@@ -517,7 +517,7 @@
     return;
   }
 
-  const VERSION = '0.8.0';
+  const VERSION = '0.8.1';
   const STORAGE_KEY = 'mog_state_v1';
 
   const UNITS = [
@@ -741,10 +741,7 @@
     unitSpeedFactor: 1,
   };
 
-  const DEFAULT_LATENCY = {
-    confirmRtts: [],      // últimos 5 RTTs do POST real (rolling window) — só pra log/diagnóstico
-    avgConfirmRtt: 0,     // mediana de confirmRtts — só pra log/diagnóstico
-  };
+  const DEFAULT_LATENCY = {};   // shape vazio mantido pra compat com migrações antigas
 
   const DEFAULT_STATE = {
     enabled: false,
@@ -905,7 +902,7 @@
         'skewHistory', 'skewMedian', 'adaptiveComp', 'extraBuffer',
         'avgRtt', 'avgOneWay', 'avgOffset', 'confirmOneways', 'avgOneWayUp',
         'skew', 'skewMeasuredAt', 'biasCalibration', 'measuredAt', 'samples',
-        'manualOverride',
+        'manualOverride', 'confirmRtts', 'avgConfirmRtt',
       ]) delete base.latency[k];
     }
     if (Array.isArray(parsed.log)) base.log = parsed.log;
@@ -1254,6 +1251,7 @@
       body1.append(type === 'support' ? 'support' : 'attack', type === 'support' ? 'Apoio' : 'Ataque');
 
       const url1 = `/game.php?village=${fromVillageId}&screen=place&try=confirm`;
+      const t0 = Date.now();
       const r1 = await fetch(url1, {
         method: 'POST',
         credentials: 'include',
@@ -1261,6 +1259,7 @@
         body: body1.toString(),
       });
       const html1 = await r1.text();
+      const rtt = Date.now() - t0;
 
       const doc1 = new DOMParser().parseFromString(html1, 'text/html');
       const errBox = doc1.querySelector('.error_box, .error, .autohide-error');
@@ -1281,7 +1280,7 @@
         throw new Error(`hash de comando (ch) ausente. campos: [${fieldsList}]`);
       }
 
-      return { hiddenFields, preparedAt: Date.now() };
+      return { hiddenFields, preparedAt: Date.now(), rtt };
     },
 
     // ETAPA 2 do envio: dispara o ataque. Usa os hidden fields obtidos no
@@ -2394,7 +2393,8 @@
   // ---------- scheduler de comandos (Agendador) ----------
   const commandTimers = new Map();           // id → fire setTimeout
   const prepareTimers = new Map();           // id → prepare setTimeout
-  const preparedBundles = new Map();         // bundleLeadId → { hiddenFields, preparedAt }
+  const preparedBundles = new Map();         // bundleLeadId → { hiddenFields, preparedAt, rtt }
+  let lastConfirmRtt = 0;                    // RTT do último POST de comando (transitório, só pro chip)
   const MAX_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;   // 7 dias
   const PREPARE_LEAD_MS = 10 * 1000;         // pré-confirma 10s antes do executeAt
 
@@ -2477,7 +2477,47 @@
         units: bundle[0].units,        // 1ª wave
         type: cmd.type,
       });
+
+      // Sincronização de relógio: 10 GETs no endpoint /api/time (Vercel) pra
+      // estabelecer offset cliente↔UTC com precisão de ms. Vercel responde
+      // {"timestamp": <utc_ms>}. Estima offset por amostra como
+      //   offset_i = serverTime + rtt/2 - localAfter
+      // Mediana podada (descarta min+max). Assume TW também em UTC NTP, então
+      // executeAt (em "tempo TW") ≈ tempo UTC.
+      const TIME_URL = 'https://twtime.vercel.app/api/time';
+      const offsetSamples = [];
+      const rttSamples = [];
+      for (let i = 0; i < 10; i++) {
+        try {
+          const t0 = Date.now();
+          const r = await fetch(TIME_URL, {
+            method: 'GET', credentials: 'omit', cache: 'no-store',
+          });
+          const t1 = Date.now();
+          const json = await r.json();
+          if (json && typeof json.timestamp === 'number') {
+            const rtt = t1 - t0;
+            const offset = json.timestamp + Math.round(rtt / 2) - t1;
+            offsetSamples.push(offset);
+            rttSamples.push(rtt);
+          }
+        } catch (_) { /* skip falha individual */ }
+        if (i < 9) await sleep(100);
+      }
+      let clockOffset = 0;
+      let rttMedian = 0;
+      if (offsetSamples.length >= 3) {
+        const sortedOff = [...offsetSamples].sort((a, b) => a - b);
+        const trimmedOff = sortedOff.slice(1, -1);
+        clockOffset = trimmedOff[Math.floor(trimmedOff.length / 2)];
+        const sortedRtt = [...rttSamples].sort((a, b) => a - b);
+        const trimmedRtt = sortedRtt.slice(1, -1);
+        rttMedian = trimmedRtt[Math.floor(trimmedRtt.length / 2)];
+      }
+      prepared.clockOffset = clockOffset;
+      prepared.rttMedian = rttMedian;
       preparedBundles.set(cmd.id, prepared);
+      pushSchedulerLog(`prepare ok: ${cmd.sourceCoords} → ${cmd.targetCoords} · rtts=[${rttSamples.join(',')}] rttMed=${rttMedian} clockOffset=${clockOffset}`);
       // status volta pra 'scheduled' — vai disparar normal no fire timer
       cmd.status = 'scheduled';
       persist();
@@ -2519,23 +2559,24 @@
     cmd.attempts++;
     persist();
 
-    // Antecipa o disparo pelo uplink estimado (RTT/2). O wsRtt vem do próprio
-    // WebSocket do TW (Timing.getEstimatedLatency) — calibrado por sessão pelo
-    // servidor, sem constantes hardcoded. Universal pra qualquer rede.
-    const T = unsafeWindow.Timing;
-    const wsRtt = (T && typeof T.getEstimatedLatency === 'function') ? T.getEstimatedLatency() : 0;
-    const compensation = wsRtt > 0 ? Math.round(wsRtt / 2) : 0;
-    const fireAtServer = cmd.executeAt - compensation;
-    const srvNow = serverNow;
+    // Relógio "real" UTC = Date.now() + clockOffset (sincronizado com Vercel
+    // /api/time no prepareForFire). Compensação one-way: usa prepRtt (RTT do
+    // try=confirm, único caminho TW disponível pra medir). Servidor TW
+    // registra chegada do POST quando o pacote chega — sem compensar, atrasa.
+    const clockOffset = prepared.clockOffset || 0;
+    const realNow = () => Date.now() + clockOffset;
+    const prepRtt = prepared.rtt || 0;
+    const compensation = prepRtt > 0 ? Math.round(prepRtt / 2) : 0;
+    const fireAtReal = cmd.executeAt - compensation;
 
     // sleep até 200ms antes do alvo, depois busy-wait. setTimeout pode overshoot
     // ~50-150ms, mas a janela de 200ms de spin absorve sem afetar a precisão final.
-    const longSleep = fireAtServer - srvNow() - 200;
+    const longSleep = fireAtReal - realNow() - 200;
     if (longSleep > 0 && longSleep < 5000) await sleep(longSleep);
-    // safety: limita spin a 1s pra evitar travar o browser caso Timing trave por algum motivo
+    // safety: limita spin a 1s
     const spinDeadline = Date.now() + 1000;
-    while (srvNow() < fireAtServer && Date.now() < spinDeadline) { /* spin */ }
-    const finalDrift = fireAtServer - srvNow(); // medido ANTES do POST (deve ser ~0 ou levemente negativo)
+    while (realNow() < fireAtReal && Date.now() < spinDeadline) { /* spin */ }
+    const finalDrift = fireAtReal - realNow(); // medido ANTES do POST (deve ser ~0 ou levemente negativo)
 
     const t0_post = Date.now();
     try {
@@ -2547,18 +2588,16 @@
         catapultTarget: cmd.catapultTarget,
       });
       const rtt_confirm = Date.now() - t0_post;
+      lastConfirmRtt = rtt_confirm;
       bundle.forEach(s => { s.status = 'sent'; s.serverResponse = res; });
 
-      // Aprende: atualiza histórico de RTT do POST real (rolling window 5).
-      const lat = state.scheduler.latency;
-      lat.confirmRtts = [...(lat.confirmRtts || []), rtt_confirm].slice(-5);
-      const sortedRtts = [...lat.confirmRtts].sort((a, b) => a - b);
-      lat.avgConfirmRtt = sortedRtts[Math.floor(sortedRtts.length / 2)];
-
-      const skew = serverNow() - cmd.executeAt;
-      const skewSign = skew >= 0 ? '+' : '';
+      // skewReal = relógio real UTC (Vercel-calibrado) - executeAt
+      // skewTW = relógio do Timing nativo TW - executeAt (pra comparar)
+      const skewReal = realNow() - cmd.executeAt;
+      const skewTW = serverNow() - cmd.executeAt;
       const totalAttacks = bundle.length;
-      pushSchedulerLog(`enviado: ${cmd.sourceCoords} → ${cmd.targetCoords} (${cmd.type}, ${totalAttacks} ataque${totalAttacks > 1 ? 's' : ''}) · skew=${skewSign}${Math.round(skew)} confirmRtt=${rtt_confirm} wsRtt=${wsRtt} comp=${compensation} drift=${Math.round(finalDrift)}`);
+      const sign = (n) => (n >= 0 ? '+' : '');
+      pushSchedulerLog(`enviado: ${cmd.sourceCoords} → ${cmd.targetCoords} (${cmd.type}, ${totalAttacks} ataque${totalAttacks > 1 ? 's' : ''}) · skewReal=${sign(skewReal)}${Math.round(skewReal)} skewTW=${sign(skewTW)}${Math.round(skewTW)} clockOffset=${clockOffset} prepRtt=${prepRtt} comp=${compensation} confirmRtt=${rtt_confirm} drift=${Math.round(finalDrift)}`);
     } catch (e) {
       bundle.forEach(s => { s.status = 'failed_request'; s.lastError = e.message; });
       pushSchedulerLog(`FALHA: ${cmd.sourceCoords} → ${cmd.targetCoords}: ${e.message}`);
@@ -3943,7 +3982,7 @@
     }
     .mog-dash-thead, .mog-dash-row {
       display: grid;
-      grid-template-columns: 80px 70px 80px 80px 1fr 110px 110px 80px 30px;
+      grid-template-columns: 80px 70px 80px 80px 1fr 80px 130px 80px 30px;
       gap: 6px; align-items: center;
       padding: 8px 12px;
       font-size: 11px;
@@ -4016,6 +4055,79 @@
     .mog-dash-st-sent { background: var(--mog-success-soft); color: var(--mog-success); }
     .mog-dash-st-failed { background: var(--mog-error-soft); color: var(--mog-error); }
     .mog-dash-st-aborted { background: var(--mog-border); color: var(--mog-text-mute); }
+
+    /* botão lápis na coluna Chegada (editar) */
+    .mog-dash-when-wrap {
+      display: flex; align-items: center; justify-content: center; gap: 4px;
+      min-width: 0;
+    }
+    .mog-dash-when-wrap .mog-dash-when {
+      min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    }
+    .mog-dash-edit-btn {
+      background: transparent; border: none; cursor: pointer;
+      color: var(--mog-text-mute); padding: 0; font-size: 12px; line-height: 1;
+      transition: color 0.15s;
+      flex-shrink: 0;
+    }
+    .mog-dash-edit-btn:hover { color: ${COLOR_ACCENT}; }
+
+    /* linha inline de edição da chegada */
+    .mog-dash-edit-row {
+      grid-column: 1 / -1;
+      padding: 10px 12px;
+      background: var(--mog-surface-2);
+      border-top: 1px solid var(--mog-border-soft);
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      font-size: 11px; color: var(--mog-text-dim);
+    }
+    .mog-dash-edit-row label {
+      color: var(--mog-text-mute); font-size: 10px; text-transform: uppercase;
+      letter-spacing: 0.3px; font-weight: 700;
+    }
+    .mog-dash-edit-input {
+      background: var(--mog-bg-deep);
+      border: 1px solid var(--mog-border-soft);
+      color: var(--mog-text);
+      font-family: 'JetBrains Mono', 'Consolas', monospace;
+      font-size: 12px;
+      padding: 5px 8px;
+      border-radius: 5px;
+      width: 200px;
+      letter-spacing: 0.5px;
+      font-variant-numeric: tabular-nums;
+    }
+    .mog-dash-edit-input:focus {
+      outline: none;
+      border-color: ${COLOR_ACCENT};
+    }
+    .mog-dash-edit-preview {
+      color: var(--mog-text-dim); font-family: 'JetBrains Mono', 'Consolas', monospace;
+      font-size: 10.5px;
+    }
+    .mog-dash-edit-preview .mog-dash-edit-out {
+      color: var(--mog-text); font-weight: 600;
+    }
+    .mog-dash-edit-error {
+      color: var(--mog-error); font-size: 10.5px; font-weight: 600;
+    }
+    .mog-dash-edit-actions {
+      display: flex; gap: 6px; margin-left: auto;
+    }
+    .mog-dash-edit-actions button {
+      padding: 5px 12px; border-radius: 5px; cursor: pointer;
+      font-size: 11px; font-weight: 600; border: 1px solid transparent;
+    }
+    .mog-dash-edit-save {
+      background: ${COLOR_ACCENT}; color: var(--mog-bg);
+    }
+    .mog-dash-edit-save:disabled {
+      background: var(--mog-border); color: var(--mog-text-mute); cursor: not-allowed;
+    }
+    .mog-dash-edit-cancel {
+      background: transparent; color: var(--mog-text-dim); border-color: var(--mog-border);
+    }
+    .mog-dash-edit-cancel:hover { color: var(--mog-text); }
 
     .mog-dash-empty {
       text-align: center; color: var(--mog-text-mute); padding: 40px 16px;
@@ -4590,15 +4702,8 @@
     const tripped = state.captchaTrippedAt > 0;
     chipCaptcha.hidden = !tripped;
 
-    // RTT — usa o medido nos POSTs reais; fallback pro WS nativo do TW
-    let rtt = state.scheduler?.latency?.avgConfirmRtt || 0;
-    if (rtt <= 0) {
-      const T = unsafeWindow.Timing;
-      if (T && typeof T.getEstimatedLatency === 'function') {
-        const ws = T.getEstimatedLatency();
-        if (ws > 0) rtt = ws;
-      }
-    }
+    // RTT — último POST real de comando (transitório, sem persistência)
+    const rtt = lastConfirmRtt;
     if (Number.isFinite(rtt) && rtt > 0) {
       chipRtt.textContent = `RTT ${Math.round(rtt)}ms`;
       chipRtt.classList.remove('mog-chip-warn', 'mog-chip-error', 'mog-chip-ok');
@@ -6264,6 +6369,32 @@
     pushSchedulerLog(`${ready} comando(s) registrado(s) e agendado(s).`);
   }
 
+  // Reagenda o bundle pra nova chegada (server time). Saída de cada wave
+  // vira newArrivalAt - travelMs + ms_offset. Mantém spread de 100ms entre waves.
+  // Pré-condições já checadas pelo chamador via isCommandReschedulable.
+  function rescheduleCommand(cmd, newArrivalAtServerTs) {
+    const bundle = getBundleSiblings(cmd);
+    const lead = bundle[0];
+    // recalcula executeAt de cada wave preservando o offset original `ms`
+    bundle.forEach(s => {
+      s.arrivalAt = newArrivalAtServerTs;
+      s.executeAt = newArrivalAtServerTs - (s.travelMs || 0) + (s.ms || 0);
+      // limpa estado transitório
+      clearTimeout(commandTimers.get(s.id));
+      clearTimeout(prepareTimers.get(s.id));
+      commandTimers.delete(s.id);
+      prepareTimers.delete(s.id);
+      preparedBundles.delete(s.id);
+      if (['scheduled', 'confirming', 'failed_overdue'].includes(s.status)) {
+        s.status = 'pending';
+        s.lastError = '';
+      }
+    });
+    persist();
+    scheduleCommand(lead);
+    pushSchedulerLog(`reagendado: ${lead.sourceCoords} → ${lead.targetCoords} · nova chegada ${fmtFullDate(newArrivalAtServerTs)}`);
+  }
+
   // Cancela um único comando (e seu bundle, já que vão juntos no mesmo POST).
   function cancelCommand(cmd) {
     const bundle = getBundleSiblings(cmd);
@@ -6294,12 +6425,93 @@
 
   // ---- painel de agendamentos (dashboard) ----
   let dashboardTickerId = null;
+  let dashboardEditingId = null;     // cmd.id sendo editado inline (chegada)
+  let dashboardEditingDraft = '';    // valor atual do input mascarado
+
+  // Máscara estendida com milissegundos: "DD/MM/AAAA HH:MM:SS.mmm" (23 chars).
+  const DT_MS_MASK_TEMPLATE = '__/__/____ __:__:__.___';
+  const DT_MS_DIGIT_SLOTS = [0, 1, 3, 4, 6, 7, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22];
+
+  function buildDtMsMask(digits) {
+    const arr = DT_MS_MASK_TEMPLATE.split('');
+    const d = String(digits).replace(/\D/g, '').slice(0, 17);
+    for (let i = 0; i < d.length; i++) arr[DT_MS_DIGIT_SLOTS[i]] = d[i];
+    return arr.join('');
+  }
+
+  function readDtMsMaskDigits(value) {
+    let out = '';
+    for (const pos of DT_MS_DIGIT_SLOTS) {
+      if (pos >= value.length) break;
+      const c = value[pos];
+      if (c >= '0' && c <= '9') out += c;
+      else break;
+    }
+    return out;
+  }
+
+  function fmtDateMsForInput(ms) {
+    if (!ms) return DT_MS_MASK_TEMPLATE;
+    const d = new Date(ms);
+    const pad = n => String(n).padStart(2, '0');
+    const digits = pad(d.getDate()) + pad(d.getMonth() + 1) + d.getFullYear()
+                 + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds())
+                 + String(d.getMilliseconds()).padStart(3, '0');
+    return buildDtMsMask(digits);
+  }
+
+  // Parseia "DD/MM/AAAA HH:MM:SS.mmm" → Unix ms local. Precisa dos 17 dígitos completos.
+  function parseDateMsFromInput(str) {
+    if (!str) return 0;
+    const digits = String(str).replace(/\D/g, '');
+    if (digits.length !== 17) return 0;
+    const dd = parseInt(digits.slice(0, 2), 10);
+    const mm = parseInt(digits.slice(2, 4), 10);
+    const yyyy = parseInt(digits.slice(4, 8), 10);
+    const hh = parseInt(digits.slice(8, 10), 10);
+    const MM = parseInt(digits.slice(10, 12), 10);
+    const ss = parseInt(digits.slice(12, 14), 10);
+    const mmm = parseInt(digits.slice(14, 17), 10);
+    if (mm < 1 || mm > 12 || dd < 1 || dd > 31 || hh > 23 || MM > 59 || ss > 59) return 0;
+    const d = new Date(yyyy, mm - 1, dd, hh, MM, ss, mmm);
+    if (isNaN(d.getTime())) return 0;
+    // valida round-trip (rejeita 31/02 por ex)
+    if (d.getDate() !== dd || d.getMonth() !== mm - 1 || d.getFullYear() !== yyyy) return 0;
+    return d.getTime();
+  }
+
+  // "HH:MM:SS" curto, sem ms — usado nas colunas Saída/Chegada do dashboard.
+  function fmtTimeShort(ms) {
+    if (!ms) return '—';
+    const d = new Date(ms);
+    const pad = n => String(n).padStart(2, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  // Decide se o comando aceita reagendamento manual.
+  // Bloqueia uma vez `prepareForFire` tenha rodado (preparedBundles tem entrada).
+  function isCommandReschedulable(cmd) {
+    if (!cmd) return false;
+    if (!['pending', 'scheduled', 'bundled'].includes(cmd.status)) return false;
+    const bundle = getBundleSiblings(cmd);
+    const lead = bundle[0] || cmd;
+    if (preparedBundles.has(lead.id)) return false;
+    return true;
+  }
   let dashboardShowHistory = false;
 
   function renderDashboard() {
     const allCmds = getAllScheduledCommands();
     const TERMINAL = ['sent', 'failed_request', 'failed_overdue', 'aborted'];
     const active = allCmds.filter(c => !TERMINAL.includes(c.status));
+    // descarta edição se o cmd não for mais editável (status mudou pra confirming/sending/etc)
+    if (dashboardEditingId) {
+      const editing = findCommandById(dashboardEditingId);
+      if (!editing || !isCommandReschedulable(editing)) {
+        dashboardEditingId = null;
+        dashboardEditingDraft = '';
+      }
+    }
     const history = allCmds.filter(c => TERMINAL.includes(c.status));
     const sent = history.filter(c => c.status === 'sent').length;
     const failed = history.length - sent;
@@ -6374,6 +6586,25 @@
       });
     });
 
+    // bind do lápis: abre/fecha o editor inline
+    content.querySelectorAll('[data-dash-act="edit"]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const cmd = findCommandById(btn.dataset.cid);
+        if (!cmd || !isCommandReschedulable(cmd)) return;
+        if (dashboardEditingId === cmd.id) {
+          dashboardEditingId = null;
+          dashboardEditingDraft = '';
+        } else {
+          dashboardEditingId = cmd.id;
+          dashboardEditingDraft = fmtDateMsForInput(cmd.arrivalAt + (cmd.ms || 0));
+        }
+        renderDashboard();
+      });
+    });
+
+    // bind do editor inline (input mascarado + salvar/cancelar)
+    bindDashEditRow();
+
     // ticker de 1s pra atualizar countdowns + detectar mudanças de status
     if (dashboardTickerId) clearInterval(dashboardTickerId);
     let lastSignature = dashboardSignature();
@@ -6413,7 +6644,13 @@
   }
 
   function renderDashTable(cmds, kind) {
-    const rows = cmds.map(c => renderDashRow(c, kind)).join('');
+    const rows = cmds.map(c => {
+      let html = renderDashRow(c, kind);
+      if (kind === 'active' && dashboardEditingId === c.id && isCommandReschedulable(c)) {
+        html += renderDashEditRow(c);
+      }
+      return html;
+    }).join('');
     return `
       <div class="mog-dash-table">
         <div class="mog-dash-thead">
@@ -6432,8 +6669,111 @@
     `;
   }
 
+  // Atualiza a previsão (saída + faltam) na linha de edição com base no input atual.
+  function refreshDashEditPreview(cmd) {
+    const preview = content.querySelector(`[data-edit-preview="${cmd.id}"]`);
+    const saveBtn = content.querySelector(`[data-edit-act="save"][data-cid="${cmd.id}"]`);
+    if (!preview || !saveBtn) return;
+    const newArrival = parseDateMsFromInput(dashboardEditingDraft);
+    if (!newArrival) {
+      preview.innerHTML = `<span class="mog-dash-edit-error">Data inválida</span>`;
+      saveBtn.disabled = true;
+      return;
+    }
+    // newArrival é tempo local. Convertendo pra "server ts": como o display já é local
+    // (fmtFullDate usa Date local) e o user digita local, usamos direto como server ts
+    // — convenção do projeto (cliente/servidor mesmo fuso). Saída derivada do bundle:
+    const bundle = getBundleSiblings(cmd);
+    const lead = bundle[0];
+    const newLeadArrival = newArrival - (cmd.ms || 0);   // desconta offset do wave atual
+    const newLeadExecuteAt = newLeadArrival - (lead.travelMs || 0);
+    const minExecuteAt = serverNow() + 2000;
+    if (newLeadExecuteAt < minExecuteAt) {
+      preview.innerHTML = `<span class="mog-dash-edit-error">Saída ficaria no passado</span>`;
+      saveBtn.disabled = true;
+      return;
+    }
+    const deltaMs = newLeadExecuteAt - serverNow();
+    const totalS = Math.max(0, Math.round(deltaMs / 1000));
+    const h = Math.floor(totalS / 3600);
+    const m = Math.floor((totalS % 3600) / 60);
+    const s = totalS % 60;
+    const cd = h > 0 ? `${h}h ${String(m).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`
+             : m > 0 ? `${m}m ${String(s).padStart(2, '0')}s`
+             : `${s}s`;
+    preview.innerHTML = `Saída: <span class="mog-dash-edit-out">${fmtFullDate(newLeadExecuteAt)}</span> · Faltam: <span class="mog-dash-edit-out">${cd}</span>`;
+    saveBtn.disabled = false;
+  }
+
+  // Bind do input mascarado e dos botões de salvar/cancelar.
+  function bindDashEditRow() {
+    if (!dashboardEditingId) return;
+    const cmd = findCommandById(dashboardEditingId);
+    if (!cmd) return;
+    const inp = content.querySelector(`[data-edit-input="${cmd.id}"]`);
+    if (inp) {
+      inp.addEventListener('input', () => {
+        // Mantém máscara: lê só dígitos do que o user digitou e reaplica template.
+        const digits = inp.value.replace(/\D/g, '').slice(0, 17);
+        const masked = buildDtMsMask(digits);
+        if (inp.value !== masked) inp.value = masked;
+        dashboardEditingDraft = masked;
+        refreshDashEditPreview(cmd);
+      });
+      inp.addEventListener('focus', () => {
+        // Posiciona caret no primeiro slot vazio
+        const digits = readDtMsMaskDigits(inp.value);
+        const pos = digits.length < DT_MS_DIGIT_SLOTS.length ? DT_MS_DIGIT_SLOTS[digits.length] : DT_MS_MASK_TEMPLATE.length;
+        setTimeout(() => inp.setSelectionRange(pos, pos), 0);
+      });
+      // primeiro render do preview
+      refreshDashEditPreview(cmd);
+    }
+    const saveBtn = content.querySelector(`[data-edit-act="save"][data-cid="${cmd.id}"]`);
+    const cancelBtn = content.querySelector(`[data-edit-act="cancel"][data-cid="${cmd.id}"]`);
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', () => {
+        dashboardEditingId = null;
+        dashboardEditingDraft = '';
+        renderDashboard();
+      });
+    }
+    if (saveBtn) {
+      saveBtn.addEventListener('click', () => {
+        const newArrival = parseDateMsFromInput(dashboardEditingDraft);
+        if (!newArrival) return;
+        const cur = findCommandById(dashboardEditingId);
+        if (!cur || !isCommandReschedulable(cur)) return;
+        // Server ts da chegada do *lead* (desconta offset da wave editada)
+        const leadArrival = newArrival - (cur.ms || 0);
+        const lead = getBundleSiblings(cur)[0];
+        const minExecuteAt = serverNow() + 2000;
+        if (leadArrival - (lead.travelMs || 0) < minExecuteAt) return;
+        rescheduleCommand(lead, leadArrival);
+        dashboardEditingId = null;
+        dashboardEditingDraft = '';
+        renderDashboard();
+      });
+    }
+  }
+
+  // Linha de edição inline da chegada (gridrow span all).
+  function renderDashEditRow(c) {
+    const initial = dashboardEditingDraft || fmtDateMsForInput(c.arrivalAt);
+    return `
+      <div class="mog-dash-edit-row" data-edit-cid="${c.id}">
+        <label>Nova chegada:</label>
+        <input class="mog-dash-edit-input" data-edit-input="${c.id}" type="text" value="${initial}" inputmode="numeric" maxlength="${DT_MS_MASK_TEMPLATE.length}" placeholder="${DT_MS_MASK_TEMPLATE}">
+        <span class="mog-dash-edit-preview" data-edit-preview="${c.id}"></span>
+        <div class="mog-dash-edit-actions">
+          <button class="mog-dash-edit-cancel" data-edit-act="cancel" data-cid="${c.id}">Cancelar</button>
+          <button class="mog-dash-edit-save" data-edit-act="save" data-cid="${c.id}">Salvar</button>
+        </div>
+      </div>
+    `;
+  }
+
   function renderDashRow(c, kind) {
-    const fmtDate = fmtFullDate;
     const unitsHtml = Object.entries(c.units || {})
       .filter(([, n]) => n > 0)
       .map(([uid, n]) => `${n}<img src="/graphic/unit/unit_${uid}.png" alt="${uid}" title="${uid}" onerror="this.style.display='none'">`)
@@ -6458,9 +6798,15 @@
       : (c.status === 'failed_request' || c.status === 'failed_overdue') ? 'mog-dash-row-failed' : '';
 
     const showCancel = kind === 'active' && ['pending', 'scheduled', 'bundled'].includes(c.status);
+    const canEdit = kind === 'active' && isCommandReschedulable(c);
 
     const typeLabel = c.type === 'support' ? 'Apoio' : 'Ataque';
     const typeCls = c.type === 'support' ? 'mog-dash-type-support' : 'mog-dash-type-attack';
+
+    const arrivalTs = c.arrivalAt + (c.ms || 0);
+    const editBtn = canEdit
+      ? `<button class="mog-dash-edit-btn" data-dash-act="edit" data-cid="${c.id}" title="Editar chegada">✎</button>`
+      : '';
 
     return `
       <div class="mog-dash-row ${rowCls}" data-cid="${c.id}" data-execute-at="${c.executeAt}">
@@ -6469,8 +6815,11 @@
         <div>${coordsLink(c.sourceCoords, c.sourceVillageId)}</div>
         <div>${coordsLink(c.targetCoords)}</div>
         <div class="mog-dash-units">${unitsHtml}</div>
-        <div class="mog-dash-when">${fmtDate(c.executeAt)}</div>
-        <div class="mog-dash-when">${fmtDate(c.arrivalAt + (c.ms || 0))}</div>
+        <div class="mog-dash-when" title="${fmtFullDate(c.executeAt)}">${fmtTimeShort(c.executeAt)}</div>
+        <div class="mog-dash-when-wrap">
+          <span class="mog-dash-when" title="${fmtFullDate(arrivalTs)}">${fmtTimeShort(arrivalTs)}.${String(new Date(arrivalTs).getMilliseconds()).padStart(3, '0')}</span>
+          ${editBtn}
+        </div>
         <div class="mog-dash-countdown" data-cd>${formatCountdown(c.executeAt)}</div>
         <div>${showCancel ? `<button class="mog-iconbtn mog-iconbtn-danger" data-dash-act="cancel" data-cid="${c.id}" title="Cancelar comando">×</button>` : ''}</div>
       </div>

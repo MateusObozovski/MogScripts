@@ -10,7 +10,8 @@ Userscript pessoal de automação para o jogo **Tribal Wars** (br142.tribalwars.
 - **Tudo num só arquivo de fonte**: `src/Mog.user.js` é vanilla JS no browser com `// @grant GM_*`. Não introduzir módulos ou dependências runtime — `package.json` só tem `javascript-obfuscator` como devDep.
 - **Só inicializa em `screen=storage`**: o IIFE faz early-return se `unsafeWindow.game_data.screen !== 'storage'`. O usuário gerencia tudo na aba do armazém; ela faz fetches HTTP em background pras outras aldeias. Em qualquer outra tela o script nem carrega o launcher. **Exceção (a partir de 0.7.1)**: o **captcha guard lite** roda ANTES do early-return em qualquer screen do TW — detecção + banner + logout + canal cross-tab. Só o bot pesado (motores, UI) fica restrito a `screen=storage`.
 - **Persistência**: `GM_setValue/GM_getValue` com chave `mog_state_v1` (mantida fixa mesmo após mudanças de schema — usar `migrateState` pra acomodar formatos antigos). Há também a chave global `mog_captcha_global_v1` (separada, sem migração) usada como fonte de verdade cross-tab pra estado de captcha — escrita pela primeira aba que detecta, lida pelas demais via polling/BroadcastChannel.
-- **Privado, sem servidor**: nada de telemetria, analytics, fetch para domínios externos. Toda comunicação é pra `*.tribalwars.com.br` (mesma origem).
+- **Servidor próprio (`twtime.vercel.app`)**: a partir de 0.8.x já era usado pra `/api/time` (sincronização de relógio). A partir de 0.9.0 também serve `/api/license/check` pra validar licenças por nick. Repo separado (`MateusObozovski/TwTime`) — clone como `c:\Projetos\TwTime`. Storage via Upstash Redis. Token admin em env var `MOG_ADMIN_TOKEN`. Fora isso, nada de telemetria/analytics — toda comunicação no jogo é pra `*.tribalwars.com.br`.
+- **Não mudar `@name` do userscript**: hoje é `Millennium`. Tampermonkey/Violentmonkey usam o `@name` como chave do GM storage; mudar = perder todas as configs dos usuários instalados (vira "outro script"). Se precisar renomear, escrever migração via `GM_listValues`/`GM_setValue` antes do bump de versão.
 - **Idioma da UI**: pt-BR. Strings visíveis ao usuário sempre em português.
 - **Versão atual**: ver `@version` no banner do userscript e a constante `VERSION`. Bump em mudança visível ao usuário; manter os dois sincronizados.
 
@@ -70,7 +71,7 @@ Termos usados no código e nas conversas com o usuário:
 {
   enabled: false,                          // toggle global do recrutador
   ui: {
-    activeSection: 'recruiter',            // 'recruiter' | 'scheduler' | 'dashboard' | 'farmer' | 'builder' | 'research'
+    activeSection: 'recruiter',            // 'recruiter' | 'scheduler' | 'dashboard' | 'farmer' | 'defenses' | 'builder' | 'settings' | 'research'
     expandedProfileId: null,
     panelOpen: false,
     logCollapsed: false,
@@ -129,6 +130,12 @@ Termos usados no código e nas conversas com o usuário:
     nextRunAt: 0,                                    // timestamp do próximo ciclo
     busy: false,                                     // lock — limpo no boot
   },
+  license: {                                          // a partir de 0.9.0 — preenchido pelo boot
+    checkedAt: 0,                                     // ts da última checagem ok no servidor
+    expiresAt: 0,                                     // ts (UTC ms) vindo do servidor
+    nick: '',                                         // nick na última checagem (auditoria local)
+    lastError: '',                                    // diagnóstico — descartado no boot
+  },
 }
 ```
 
@@ -148,6 +155,7 @@ Termos usados no código e nas conversas com o usuário:
 | 0.7.1 | **Não muda shape do `mog_state_v1`.** Adiciona chave **separada** `mog_captcha_global_v1` (fonte de verdade cross-tab pra captcha — `{trippedAt, reason, sourceTab}`). `state.captchaTrippedAt` continua existindo por compat | Sem migração no `migrateState`. Boot do bot promove flag local antiga pra global se necessário |
 | v6 (0.8.0) | Adiciona `state.builder` (Construtor): `enabled`, `templates[]`, `profiles[]`, `log[]`, `ui`, `busy`, `premiumDetected`. `ui.activeSection` ganha `'builder'`. `BUILDING_KEYS` validado via snippet: 17 edifícios, índice 4 = `watchtower` (sem `church`/`church_f` no br142) | `migrateState` chama `migrateBuilder(parsed.builder)` que cria default se ausente. `migrateBuilder` zera `busy` e `running` de cada profile no boot |
 | 0.8.0 (UI) | **Não muda shape do `mog_state_v1`.** Toggle "Ativo/Pausado" global do header **removido**; `state.enabled` fica no shape (compat) mas não é mais lido pela lógica. Cada módulo (Recrutador profiles, Farmador, Construtor) agora controla seu ciclo apenas pela própria flag `enabled`, com `state.captchaTrippedAt > 0` como pause global enquanto captcha ativo. Captcha trip não zera mais `enabled` por-módulo — preserva intenção do usuário pra `resumeFromCaptcha` saber quem religar. Header passa a mostrar 3 chips read-only (Captcha/RTT/relógio servidor). Paleta migrada pra `#222831`/`#393E46`/`#00ADB5`/`#EEEEEE` via CSS vars (`:root { --mog-* }`). Sidebar perde itens "Em breve" (Pesquisa/Configurações ressurgem quando implementados) | Sem migração — flag `state.enabled` herdada é ignorada |
+| v7 (0.9.0) | Adiciona `state.license` (`{checkedAt, expiresAt, nick, lastError}`) — validado no boot via `twtime.vercel.app/api/license/check` (identidade pelo `game_data.player.name`, cross-mundo). Bloqueio total se inválido/sem rede: `renderLicenseBlock` substitui `renderContent`, recoveries (`scheduleProfileNext`/`recoverScheduledCommands`/`recoverFarmerSchedule`/`recoverBuilderSchedule`) ficam atrás de `runBootRecoveries()` que só roda em fluxo OK. Nova seção sidebar **Ferramentas → Configurações** ressuscitada (`state.ui.activeSection === 'settings'`) com botões export/import e re-validar licença. Header ganha 4º chip `mog-chip-license` colorido por proximidade (>7d verde, ≤7d amarelo, ≤2d vermelho). Captcha guard segue rodando antes de tudo | `migrateState` chama `migrateLicense(parsed.license)` que cria default zerado. `lastError` é descartado no boot (transitório) |
 
 **Sempre que mudar o shape, adicionar uma linha aqui e código de migração.** Nunca quebrar usuários antigos.
 
@@ -350,7 +358,9 @@ Pra cada lead command (commandIndexInSource = 0):
 - **Spy puro com troca temporária**: hoje, quando bárbara volta com perdas, o ciclo só registra wall-break sem mandar espião. Implementar troca temporária de A pra `{spy:1}` no ciclo (similar à Buscar bárbaras) pra confirmar a defesa antes de marcar.
 - **Cunhagem**: cunhar moedas com estoque mínimo.
 - **Balanceador de Recursos**: redistribuir via mercado.
-- **Configurações**: tema, posição do launcher, etc.
+- **Configurações**: tema, posição do launcher, etc. (Hoje só tem export/import de configs e re-validar licença.)
+- **Licença — cache offline**: hoje bloqueio é total se servidor está fora do ar. Se Vercel cair, ninguém usa o bot. Considerar cache de last-validated-at com TTL (24h?) pra dar resiliência. Tradeoff: revogação leva mais tempo a propagar.
+- **Licença — admin UI**: hoje é página HTML simples em `/admin` com login por token em sessionStorage. Funcional pra dezenas de usuários. Se virar centenas, paginar `/api/license/list` e adicionar busca.
 
 ---
 

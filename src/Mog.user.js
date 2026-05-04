@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Millennium
-// @version      0.8.1
+// @version      0.9.0
 // @description  Toolkit pessoal para Tribal Wars
 // @match        https://*.tribalwars.com.br/game.php?*
 // @grant        GM_addStyle
@@ -517,7 +517,7 @@
     return;
   }
 
-  const VERSION = '0.8.1';
+  const VERSION = '0.9.0';
   const STORAGE_KEY = 'mog_state_v1';
 
   const UNITS = [
@@ -802,6 +802,15 @@
       // Cache: detectado no primeiro fetchMainBuilding bem-sucedido. null = ainda não medido.
       premiumDetected: null,
     },
+    // Licença vem do servidor (twtime.vercel.app/api/license/check). Boot bloqueia
+    // o painel se invalida ou se não conseguir validar. Não persiste nick em lowercase
+    // — o que importa é o resultado da última checagem; nick original fica só pra log.
+    license: {
+      checkedAt: 0,
+      expiresAt: 0,
+      nick: '',
+      lastError: '',
+    },
   };
 
   // ---------- storage ----------
@@ -964,6 +973,17 @@
     return base;
   }
 
+  function migrateLicense(parsed) {
+    const base = structuredClone(DEFAULT_STATE.license);
+    if (!parsed) return base;
+    if (Number.isFinite(parsed.checkedAt)) base.checkedAt = parsed.checkedAt;
+    if (Number.isFinite(parsed.expiresAt)) base.expiresAt = parsed.expiresAt;
+    if (typeof parsed.nick === 'string') base.nick = parsed.nick;
+    // lastError é diagnóstico transitório — descartado no boot
+    base.lastError = '';
+    return base;
+  }
+
   function migrateState(parsed) {
     const base = structuredClone(DEFAULT_STATE);
     base.enabled = parsed.enabled ?? false;
@@ -972,6 +992,7 @@
     base.scheduler = migrateScheduler(parsed.scheduler);
     base.farmer = migrateFarmer(parsed.farmer);
     base.builder = migrateBuilder(parsed.builder);
+    base.license = migrateLicense(parsed.license);
 
     if (parsed.recruiter?.profiles) {
       base.recruiter.profiles = parsed.recruiter.profiles.map(p => migrateProfile(p));
@@ -2883,6 +2904,10 @@
       0%, 100% { opacity: 1; }
       50% { opacity: 0.4; }
     }
+    .mog-chip-license { font-variant-numeric: tabular-nums; }
+    .mog-chip-license.mog-chip-ok { color: var(--mog-success); border-color: var(--mog-success-soft); }
+    .mog-chip-license.mog-chip-warn { color: var(--mog-warn); border-color: var(--mog-warn-soft); }
+    .mog-chip-license.mog-chip-error { color: var(--mog-error); border-color: var(--mog-error-soft); }
 
     .mog-toggle {
       padding: 8px 16px;
@@ -4585,6 +4610,7 @@
         </span>
         <span class="mog-chip mog-chip-rtt" id="mog-chip-rtt" title="Latência média ao servidor" hidden>RTT —</span>
         <span class="mog-chip mog-chip-clock" id="mog-chip-clock" title="Hora do servidor" hidden>--:--:--</span>
+        <span class="mog-chip mog-chip-license" id="mog-chip-license" title="Licença" hidden>Licença —</span>
       </div>
       <button class="mog-close" id="mog-close">&times;</button>
     </div>
@@ -4646,6 +4672,19 @@
         </div>
       </div>
 
+      <div class="mog-side-section" data-side-section="tools">
+        <div class="mog-side-title" data-side-toggle="tools">
+          <span class="mog-side-caret">▼</span>
+          <span>Ferramentas</span>
+        </div>
+        <div class="mog-side-items">
+          <div class="mog-side-item" data-section="settings">
+            <span class="mog-side-icon">⚙</span>
+            <span>Configurações</span>
+          </div>
+        </div>
+      </div>
+
     </aside>
 
     <div class="mog-main">
@@ -4687,10 +4726,11 @@
 
   if (state.ui.panelOpen) openPanel();
 
-  // ---- header chips (read-only: latência, hora servidor, captcha) ----
+  // ---- header chips (read-only: latência, hora servidor, captcha, licença) ----
   const chipCaptcha = panel.querySelector('#mog-chip-captcha');
   const chipRtt = panel.querySelector('#mog-chip-rtt');
   const chipClock = panel.querySelector('#mog-chip-clock');
+  const chipLicense = panel.querySelector('#mog-chip-license');
 
   chipCaptcha.addEventListener('click', () => {
     resumeFromCaptcha();
@@ -4725,6 +4765,30 @@
       chipClock.textContent = `${hh}:${mm}:${ss}`;
     } catch {
       chipClock.textContent = '--:--:--';
+    }
+
+    // Licença — dias restantes baseado no expiresAt (validado no boot)
+    const lic = state.license;
+    if (lic && lic.expiresAt > 0) {
+      const remainingMs = lic.expiresAt - Date.now();
+      const days = remainingMs / (24 * 3600 * 1000);
+      chipLicense.hidden = false;
+      chipLicense.classList.remove('mog-chip-ok', 'mog-chip-warn', 'mog-chip-error');
+      if (days <= 0) {
+        chipLicense.textContent = 'Licença expirada';
+        chipLicense.classList.add('mog-chip-error');
+      } else if (days < 1) {
+        chipLicense.textContent = `Licença: ${Math.max(1, Math.round(days * 24))}h`;
+        chipLicense.classList.add('mog-chip-error');
+      } else {
+        const d = Math.floor(days);
+        chipLicense.textContent = `Licença: ${d}d`;
+        if (d <= 2) chipLicense.classList.add('mog-chip-error');
+        else if (d <= 7) chipLicense.classList.add('mog-chip-warn');
+        else chipLicense.classList.add('mog-chip-ok');
+      }
+    } else {
+      chipLicense.hidden = true;
     }
 
     // Launcher dot reflete "tem algum módulo ativo"
@@ -4792,6 +4856,183 @@
   // ---- content router ----
   const content = panel.querySelector('#mog-content');
 
+  // ============================================================
+  // LICENÇA — validação no boot via twtime.vercel.app
+  // ============================================================
+  // Identifica usuário pelo nick (game_data.player.name). Servidor normaliza
+  // pra lowercase. Bloqueio total: se inválida ou sem rede, painel não abre
+  // e recovery de timers (scheduler/farmer/builder) é pulado. Captcha guard
+  // segue rodando (vive antes do early-return).
+  const LICENSE_API_URL = 'https://twtime.vercel.app/api/license/check';
+  const LICENSE_TIMEOUT_MS = 5000;
+
+  async function checkLicense() {
+    const player = unsafeWindow.game_data?.player || {};
+    const nick = String(player.name || '').trim();
+    const world = String(unsafeWindow.game_data?.world || '');
+
+    if (!nick) {
+      return { ok: false, reason: 'no_nick', message: 'Não foi possível ler o nick do jogador.' };
+    }
+
+    const url = `${LICENSE_API_URL}?nick=${encodeURIComponent(nick)}&world=${encodeURIComponent(world)}`;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), LICENSE_TIMEOUT_MS);
+    try {
+      const r = await fetch(url, { method: 'GET', credentials: 'omit', cache: 'no-store', signal: ctrl.signal });
+      clearTimeout(timer);
+      if (!r.ok) {
+        return { ok: false, reason: 'http_error', message: `Servidor respondeu HTTP ${r.status}.`, nick };
+      }
+      const json = await r.json();
+      if (json && json.valid === true && Number.isFinite(json.expiresAt) && json.expiresAt > Date.now()) {
+        // sucesso — atualiza state.license
+        state.license.checkedAt = Date.now();
+        state.license.expiresAt = json.expiresAt;
+        state.license.nick = nick;
+        state.license.lastError = '';
+        persist();
+        return { ok: true, expiresAt: json.expiresAt, nick };
+      }
+      // valid=false ou payload inesperado
+      const reason = json?.reason || 'invalid';
+      const message = reason === 'expired'
+        ? `Licença expirada em ${new Date(json.expiresAt || 0).toLocaleString('pt-BR')}.`
+        : 'Nick não autorizado.';
+      // limpa estado local pra não enganar usuário com chip "verde"
+      state.license.expiresAt = 0;
+      state.license.nick = nick;
+      state.license.lastError = reason;
+      persist();
+      return { ok: false, reason, message, nick };
+    } catch (e) {
+      clearTimeout(timer);
+      state.license.lastError = e.name === 'AbortError' ? 'timeout' : (e.message || 'network_error');
+      persist();
+      return { ok: false, reason: 'network', message: 'Sem conexão com o servidor de licença.', nick };
+    }
+  }
+
+  function renderLicenseBlock(result) {
+    const nick = result?.nick || unsafeWindow.game_data?.player?.name || '(desconhecido)';
+    const world = unsafeWindow.game_data?.world || '';
+    const isNetwork = result?.reason === 'network' || result?.reason === 'http_error' || result?.reason === 'no_nick';
+    const title = isNetwork ? 'Sem conexão com o servidor de licença' : (result?.reason === 'expired' ? 'Licença expirada' : 'Acesso não autorizado');
+    const detail = result?.message || '';
+    content.innerHTML = `
+      <div style="padding:32px; max-width:560px; margin:40px auto; text-align:center;">
+        <div style="font-size:48px; line-height:1;">🔒</div>
+        <h2 style="color:var(--mog-error); margin:14px 0 6px;">${escapeHtml(title)}</h2>
+        <div style="color:var(--mog-text-mute); margin-bottom:22px;">${escapeHtml(detail)}</div>
+        <div style="background:var(--mog-surface-2); border:1px solid var(--mog-border); border-radius:8px; padding:16px; margin-bottom:20px; text-align:left;">
+          <div style="font-size:11px; color:var(--mog-text-mute); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px;">Seu nick</div>
+          <div style="font-size:18px; font-weight:700; color:var(--mog-text); user-select:all;">${escapeHtml(nick)}</div>
+          ${world ? `<div style="font-size:11px; color:var(--mog-text-mute); margin-top:6px;">mundo: ${escapeHtml(world)}</div>` : ''}
+        </div>
+        <div style="display:flex; gap:8px; justify-content:center; flex-wrap:wrap;">
+          <button class="mog-btn" id="mog-license-retry">Tentar novamente</button>
+          <button class="mog-btn mog-btn-ghost" id="mog-license-export">Exportar configurações</button>
+        </div>
+        <div style="margin-top:18px; font-size:11px; color:var(--mog-text-mute);">
+          Millennium v${VERSION}
+        </div>
+      </div>
+    `;
+    panel.querySelector('#mog-license-retry')?.addEventListener('click', async () => {
+      const btn = panel.querySelector('#mog-license-retry');
+      btn.disabled = true;
+      btn.textContent = 'Validando…';
+      const r = await checkLicense();
+      if (r.ok) {
+        // re-boot fluxo normal sem reload — render normal e religa recoveries
+        renderContent();
+        runBootRecoveries();
+      } else {
+        renderLicenseBlock(r);
+      }
+    });
+    panel.querySelector('#mog-license-export')?.addEventListener('click', exportConfig);
+  }
+
+  // Recoveries dos motores (timers que sobrevivem reload). Só roda em fluxo
+  // normal — bloqueio de licença pula isso pra nada disparar.
+  function runBootRecoveries() {
+    if (state.captchaTrippedAt === 0) {
+      state.recruiter.profiles.forEach(p => {
+        if (p.enabled) scheduleProfileNext(p);
+      });
+    }
+    recoverScheduledCommands();
+    recoverFarmerSchedule();
+    recoverBuilderSchedule();
+  }
+
+  // ============================================================
+  // Export/Import de configurações — rede de segurança contra reset do navegador.
+  // ============================================================
+  // GM_setValue já sobrevive a updates do .user.js (Tampermonkey usa @name como
+  // chave). Mas se o usuário trocar de PC/navegador ou limpar storage, ele perde
+  // tudo. Export gera um JSON com todo o state EXCETO license (pra ninguém
+  // compartilhar configs e levar a licença de outro). Import valida shape e
+  // reescreve o state via saveState + reload.
+  function exportConfig() {
+    const snapshot = { ...state, license: undefined };
+    delete snapshot.license;
+    const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const player = unsafeWindow.game_data?.player?.name || 'mog';
+    const safe = String(player).replace(/[^A-Za-z0-9_-]/g, '_');
+    const dt = new Date();
+    const ymd = `${dt.getFullYear()}${String(dt.getMonth() + 1).padStart(2, '0')}${String(dt.getDate()).padStart(2, '0')}`;
+    a.href = url;
+    a.download = `mog-config-${safe}-${ymd}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function importConfig() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'application/json,.json';
+    input.addEventListener('change', () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        let parsed;
+        try {
+          parsed = JSON.parse(String(reader.result || ''));
+        } catch {
+          alert('Arquivo inválido — não é JSON válido.');
+          return;
+        }
+        // valida shape mínimo: tem que ter pelo menos um dos módulos conhecidos
+        const hasShape = parsed && typeof parsed === 'object' && (
+          parsed.recruiter || parsed.scheduler || parsed.farmer || parsed.builder
+        );
+        if (!hasShape) {
+          alert('Arquivo não parece ser um backup de configurações do Millennium.');
+          return;
+        }
+        if (!confirm('Isso vai SUBSTITUIR todas as configurações atuais e recarregar a aba. Continuar?')) {
+          return;
+        }
+        // preserva licença atual (não vem no backup intencionalmente)
+        const merged = { ...parsed, license: state.license };
+        const migrated = migrateState(merged);
+        // license sobrevive porque migrateLicense respeita o que veio
+        migrated.license = state.license;
+        saveState(migrated);
+        location.reload();
+      };
+      reader.readAsText(file);
+    });
+    input.click();
+  }
+
   function renderContent() {
     if (state.ui.activeSection === 'recruiter') {
       renderRecruiter();
@@ -4805,6 +5046,8 @@
       renderDefenses();
     } else if (state.ui.activeSection === 'builder') {
       renderBuilder();
+    } else if (state.ui.activeSection === 'settings') {
+      renderSettings();
     } else {
       renderPlaceholder(state.ui.activeSection);
     }
@@ -4850,6 +5093,65 @@
         <div class="mog-placeholder-text">Disponível em breve.</div>
       </div>
     `;
+  }
+
+  // ---- settings section ----
+  function renderSettings() {
+    const lic = state.license || {};
+    const expISO = lic.expiresAt > 0 ? new Date(lic.expiresAt).toLocaleString('pt-BR') : '—';
+    const checkedISO = lic.checkedAt > 0 ? new Date(lic.checkedAt).toLocaleString('pt-BR') : '—';
+    const remaining = lic.expiresAt > 0 ? Math.max(0, lic.expiresAt - Date.now()) : 0;
+    const days = Math.floor(remaining / (24 * 3600 * 1000));
+
+    content.innerHTML = `
+      <div style="padding: 18px 24px; max-width: 720px;">
+        <h3 style="margin: 0 0 14px; color: var(--mog-text);">Configurações</h3>
+
+        <div style="background:var(--mog-surface-2); border:1px solid var(--mog-border); border-radius:8px; padding:16px; margin-bottom:14px;">
+          <div style="font-size:11px; color:var(--mog-text-mute); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">Licença</div>
+          <table style="width:100%; font-size:13px; color:var(--mog-text);">
+            <tr><td style="padding:3px 0; color:var(--mog-text-mute); width:140px;">Nick</td><td>${escapeHtml(lic.nick || unsafeWindow.game_data?.player?.name || '—')}</td></tr>
+            <tr><td style="padding:3px 0; color:var(--mog-text-mute);">Expira em</td><td>${escapeHtml(expISO)} ${days > 0 ? `<span style="color:var(--mog-text-mute);">(${days} dia${days === 1 ? '' : 's'})</span>` : ''}</td></tr>
+            <tr><td style="padding:3px 0; color:var(--mog-text-mute);">Última checagem</td><td>${escapeHtml(checkedISO)}</td></tr>
+          </table>
+          <div style="margin-top:10px;">
+            <button class="mog-btn mog-btn-ghost" id="mog-settings-recheck">Revalidar agora</button>
+          </div>
+        </div>
+
+        <div style="background:var(--mog-surface-2); border:1px solid var(--mog-border); border-radius:8px; padding:16px; margin-bottom:14px;">
+          <div style="font-size:11px; color:var(--mog-text-mute); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">Backup de configurações</div>
+          <div style="font-size:12px; color:var(--mog-text-mute); margin-bottom:12px;">
+            Suas configurações já são preservadas entre atualizações da extensão pelo Tampermonkey. Use o backup manual caso troque de PC, navegador ou queira restaurar um snapshot.
+            <br><strong style="color:var(--mog-text);">A licença não é incluída no backup</strong> — ela é validada pelo nick a cada login.
+          </div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="mog-btn" id="mog-settings-export">Exportar configurações</button>
+            <button class="mog-btn mog-btn-ghost" id="mog-settings-import">Importar configurações</button>
+          </div>
+        </div>
+
+        <div style="font-size:11px; color:var(--mog-text-mute); margin-top:16px;">
+          Millennium v${VERSION}
+        </div>
+      </div>
+    `;
+
+    panel.querySelector('#mog-settings-export')?.addEventListener('click', exportConfig);
+    panel.querySelector('#mog-settings-import')?.addEventListener('click', importConfig);
+    panel.querySelector('#mog-settings-recheck')?.addEventListener('click', async () => {
+      const btn = panel.querySelector('#mog-settings-recheck');
+      btn.disabled = true;
+      btn.textContent = 'Validando…';
+      const r = await checkLicense();
+      if (!r.ok) {
+        renderLicenseBlock(r);
+        updateHeadChips();
+      } else {
+        renderSettings();
+        updateHeadChips();
+      }
+    });
   }
 
   // ---- scheduler section ----
@@ -8985,18 +9287,19 @@
   }, 1000);
 
   // initial
-  renderContent();
   renderLog();
-  if (state.captchaTrippedAt === 0) {
-    state.recruiter.profiles.forEach(p => {
-      if (p.enabled) scheduleProfileNext(p);
-    });
-  }
-  recoverScheduledCommands();
-
-  // farmer: re-agenda timer se enabled antes do reload
-  recoverFarmerSchedule();
-
-  // builder: re-agenda profiles habilitados se módulo estava ligado
-  recoverBuilderSchedule();
+  // Boot async: valida licença ANTES de renderizar painel ou re-agendar timers.
+  // Resultado inválido (expirado, nick desconhecido, sem rede) → tela de bloqueio
+  // e nenhum motor é religado. Captcha guard segue rodando (vive antes do early-return).
+  (async () => {
+    const result = await checkLicense();
+    if (!result.ok) {
+      renderLicenseBlock(result);
+      updateHeadChips();
+      return;
+    }
+    renderContent();
+    runBootRecoveries();
+    updateHeadChips();
+  })();
 })();
